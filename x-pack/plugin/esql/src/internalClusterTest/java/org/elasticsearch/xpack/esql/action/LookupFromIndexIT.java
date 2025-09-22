@@ -377,7 +377,7 @@ public class LookupFromIndexIT extends AbstractEsqlIntegTestCase {
                 TEST_REQUEST_TIMEOUT
             );
             final String finalNodeWithShard = nodeWithShard;
-            boolean expressionJoin = EsqlCapabilities.Cap.LOOKUP_JOIN_ON_BOOLEAN_EXPRESSION.isEnabled() ? randomBoolean() : false;
+            boolean expressionJoin = true; // EsqlCapabilities.Cap.LOOKUP_JOIN_ON_BOOLEAN_EXPRESSION.isEnabled() ? randomBoolean() : false;
             List<MatchConfig> matchFields = new ArrayList<>();
             List<Expression> joinOnConditions = new ArrayList<>();
             if (expressionJoin) {
@@ -389,7 +389,7 @@ public class LookupFromIndexIT extends AbstractEsqlIntegTestCase {
                     );
                     FieldAttribute rightAttr = new FieldAttribute(
                         Source.EMPTY,
-                        "rkey" + i,
+                        "fakeKeyRight",
                         new EsField("rkey" + i, keyTypes.get(i), Collections.emptyMap(), true, EsField.TimeSeriesFieldType.NONE)
                     );
                     joinOnConditions.add(new Equals(Source.EMPTY, leftAttr, rightAttr));

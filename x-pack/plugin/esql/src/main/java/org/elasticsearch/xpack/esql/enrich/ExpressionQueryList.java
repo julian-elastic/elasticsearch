@@ -23,6 +23,7 @@ import org.elasticsearch.search.internal.AliasFilter;
 import org.elasticsearch.xpack.esql.capabilities.TranslationAware;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.expression.predicate.Predicates;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.EsqlBinaryComparison;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.LucenePushdownPredicates;
@@ -152,7 +153,8 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
                             Block block = inputPage.getBlock(i);
                             Expression right = binaryComparison.right();
                             if (right instanceof Attribute rightAttribute) {
-                                MappedFieldType fieldType = context.getFieldType(rightAttribute.name());
+                                String rightAttributeName = getAttributeName(rightAttribute);
+                                MappedFieldType fieldType = context.getFieldType(rightAttributeName);
                                 if (fieldType != null) {
                                     queryLists.add(
                                         new BinaryComparisonQueryList(
@@ -194,6 +196,13 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
                 throw new IllegalStateException("Only binary comparisons are supported in join ON conditions, but got: " + expr);
             }
         }
+    }
+
+    private String getAttributeName(Attribute attribute) {
+        if (attribute instanceof FieldAttribute fieldAttribute) {
+            return fieldAttribute.fieldName().string();
+        }
+        return attribute.name();
     }
 
     private void addToPreJoinFilters(QueryBuilder query) {
