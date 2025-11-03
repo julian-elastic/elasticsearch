@@ -12,6 +12,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.Page;
@@ -24,6 +25,8 @@ import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.Rewriteable;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.search.internal.AliasFilter;
+import org.elasticsearch.xcontent.XContentFactory;
+import org.elasticsearch.xcontent.XContentType;
 import org.elasticsearch.xpack.esql.capabilities.TranslationAware;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
@@ -36,6 +39,7 @@ import org.elasticsearch.xpack.esql.plan.physical.EsSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plugin.EsqlFlags;
+import org.elasticsearch.xpack.esql.querydsl.query.PercolateQueryBuilder;
 import org.elasticsearch.xpack.esql.stats.SearchContextStats;
 
 import java.io.IOException;
@@ -69,6 +73,17 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
     private final List<MatchConfig> matchFields;
     private DirectQueryProcessor directQueryProcessor = null;
 
+    public enum Approach {
+        WILDCARD_MATCH_DIRECT,
+        WILDCARD_MATCH_QUERY,
+        WILDCARD_MATCH_SINGLE_COLUMN,
+        PERCOLATOR_QUERY,
+        IN_MEMORY_PREFIX_BASIC,
+        IN_MEMORY_PREFIX_TRIE
+    }
+
+    private Approach approach = Approach.IN_MEMORY_PREFIX_TRIE;
+
     private ExpressionQueryList(
         List<QueryList> queryLists,
         SearchExecutionContext context,
@@ -88,7 +103,40 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
             new EsqlFlags(clusterService.getClusterSettings())
         );
         buildPreJoinFilter(rightPreJoinPlan, clusterService);
-        initializeBulkWildcardMatchQueryList(clusterService);
+        if (approach == Approach.WILDCARD_MATCH_DIRECT) {
+            initializeBulkWildcardMatchQueryList(clusterService);
+        } else if (approach == Approach.IN_MEMORY_PREFIX_BASIC || approach == Approach.IN_MEMORY_PREFIX_TRIE) {
+            initializeInMemoryPrefixQueryList(clusterService);
+        }
+    }
+
+    private void initializeInMemoryPrefixQueryList(ClusterService clusterService) {
+        // Check if we have the "folder" field in the lookup index
+        MappedFieldType folderField = context.getFieldType("folder");
+
+        if (folderField == null) {
+            return; // Not applicable for in-memory prefix matching
+        }
+
+        // Find folder_path field using matchFields to get the channel
+        Block folderPathBlock = null;
+        if (inputPage != null && matchFields != null) {
+            for (MatchConfig matchField : matchFields) {
+                if ("folder_path".equals(matchField.fieldName())) {
+                    int channel = matchField.channel();
+                    if (channel < inputPage.getBlockCount()) {
+                        folderPathBlock = inputPage.getBlock(channel);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If folder_path block found, create in-memory prefix query processor
+        if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock) {
+            // Use NOOP_WARNINGS for now - warnings will be handled by the operator
+            directQueryProcessor = new InMemoryPrefixDirectQueryProcessor(folderField, folderPathBlock, approach, Warnings.NOOP_WARNINGS);
+        }
     }
 
     /**
@@ -282,47 +330,25 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
      * Returns the query at the given position.
      * The query is a conjunction of all queries from the input lists at the same position.
      * If a pre-join filter exists, it is also added to the query.
+     *
      * @param position The position of the query to return.
      * @return The query at the given position, or null if any of the match fields are null.
      */
     @Override
     public Query getQuery(int position) {
         try {
-            // First verify the field exists and is of type percolator
-            MappedFieldType termQueryField = context.getFieldType("term_query_field");
-            MappedFieldType wildcardQueryField = context.getFieldType("wildcard_query_field");
-
-            if (termQueryField != null && wildcardQueryField != null) {
-
-                // Find folder_path field using matchFields to get the channel
-                // matchFields maps left-side field names to their channels in inputPage
-                Block folderPathBlock = null;
-                if (inputPage != null && matchFields != null) {
-                    for (MatchConfig matchField : matchFields) {
-                        if ("folder_path".equals(matchField.fieldName())) {
-                            int channel = matchField.channel();
-                            if (channel < inputPage.getBlockCount()) {
-                                folderPathBlock = inputPage.getBlock(channel);
-                                break;
-                            }
-                        }
-                    }
+            if (approach == Approach.WILDCARD_MATCH_QUERY) {
+                WildcardMatchQuery q = applyAsWildcardMatchQuery(position);
+                if (q != null) {
+                    return q;
                 }
-
-                // If folder_path block found, read the value at this position
-                String folderValue = null;
-                if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock bytesRefBlock) {
-                    if (position < bytesRefBlock.getPositionCount() && bytesRefBlock.isNull(position) == false) {
-                        BytesRef folderBytesRef = bytesRefBlock.getBytesRef(position, new BytesRef());
-                        folderValue = folderBytesRef.utf8ToString();
-                    }
-                }
-
-                // If we couldn't read folder_path, skip wildcard query
-                if (folderValue != null) {
-                    return new WildcardMatchQuery(folderValue, termQueryField, wildcardQueryField, context);
+            } else if (approach == Approach.PERCOLATOR_QUERY) {
+                Query q = applyAsPerculatorQuery(position);
+                if (q != null) {
+                    return q;
                 }
             }
+
             BooleanQuery.Builder builder = new BooleanQuery.Builder();
             for (QueryList queryList : queryLists) {
                 Query q = queryList.getQuery(position);
@@ -347,9 +373,96 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
         }
     }
 
+    private WildcardMatchQuery applyAsWildcardMatchQuery(int position) {
+        // First verify the field exists and is of type percolator
+        MappedFieldType termQueryField = context.getFieldType("term_query_field");
+        MappedFieldType wildcardQueryField = context.getFieldType("wildcard_query_field");
+
+        if (termQueryField != null && wildcardQueryField != null) {
+
+            // Find folder_path field using matchFields to get the channel
+            // matchFields maps left-side field names to their channels in inputPage
+            Block folderPathBlock = null;
+            if (inputPage != null && matchFields != null) {
+                for (MatchConfig matchField : matchFields) {
+                    if ("folder_path".equals(matchField.fieldName())) {
+                        int channel = matchField.channel();
+                        if (channel < inputPage.getBlockCount()) {
+                            folderPathBlock = inputPage.getBlock(channel);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // If folder_path block found, read the value at this position
+            String folderValue = null;
+            if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock bytesRefBlock) {
+                if (position < bytesRefBlock.getPositionCount() && bytesRefBlock.isNull(position) == false) {
+                    BytesRef folderBytesRef = bytesRefBlock.getBytesRef(position, new BytesRef());
+                    folderValue = folderBytesRef.utf8ToString();
+                }
+            }
+
+            // If we couldn't read folder_path, skip wildcard query
+            if (folderValue != null) {
+                return new WildcardMatchQuery(folderValue, termQueryField, wildcardQueryField, context);
+            }
+        }
+        return null;
+    }
+
+    private Query applyAsPerculatorQuery(int position) throws IOException {
+        // First verify the field exists and is of type percolator
+        MappedFieldType percolatorFieldType = context.getFieldType("percolator_query");
+        if (percolatorFieldType == null) {
+            // Field doesn't exist, skip percolator query
+            return null;
+        }
+        // Find folder_path field using matchFields to get the channel
+        // matchFields maps left-side field names to their channels in inputPage
+        Block folderPathBlock = null;
+        if (inputPage != null && matchFields != null) {
+            for (MatchConfig matchField : matchFields) {
+                if ("folder_path".equals(matchField.fieldName())) {
+                    int channel = matchField.channel();
+                    if (channel < inputPage.getBlockCount()) {
+                        folderPathBlock = inputPage.getBlock(channel);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If folder_path block found, read the value at this position
+        String folderValue = null;
+        if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock bytesRefBlock) {
+            if (position < bytesRefBlock.getPositionCount() && bytesRefBlock.isNull(position) == false) {
+                BytesRef folderBytesRef = bytesRefBlock.getBytesRef(position, new BytesRef());
+                folderValue = folderBytesRef.utf8ToString();
+            }
+        }
+
+        // If we couldn't read folder_path, skip percolator query
+        if (folderValue == null) {
+            return null;
+        }
+
+        BytesReference document = BytesReference.bytes(
+            XContentFactory.jsonBuilder().startObject().field("folder", folderValue).endObject()
+        );
+        PercolateQueryBuilder percolateQueryBuilder = new PercolateQueryBuilder("percolator_query", document, XContentType.JSON);
+        Query percolateQuery = percolateQueryBuilder.toQuery(context);
+        if (percolateQuery == null) {
+            throw new IllegalStateException("PercolateQueryBuilder.toQuery() returned null - percolator query failed to build");
+        }
+        return percolateQuery;
+    }
+
     /**
      * Returns the number of positions in the query list.
      * The number of positions is the same for all query lists.
+     *
      * @return The number of positions in the query list.
      * @throws IllegalArgumentException if the query lists have different position counts.
      */

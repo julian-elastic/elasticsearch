@@ -72,6 +72,7 @@ dependencies {
   testImplementation('org.webjars.npm:fontsource__roboto-mono:4.5.7')
 
   internalClusterTestImplementation project(":modules:mapper-extras")
+  internalClusterTestImplementation project(":modules:percolator")
 }
 
 tasks.named("dependencyLicenses").configure {

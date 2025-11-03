@@ -695,14 +695,32 @@ public abstract class AbstractLookupService<R extends AbstractLookupService.Requ
         Releasable release
     ) {
         public static LookupShardContext fromSearchContext(SearchContext searchContext) {
+            SearchExecutionContext originalContext = searchContext.getSearchExecutionContext();
+            // Wrap the SearchExecutionContext to return our PercolatorFieldType wrapper for percolator fields
+            SearchExecutionContext wrappedContext = new SearchExecutionContext(originalContext) {
+                @Override
+                public MappedFieldType getFieldType(String name) {
+                    MappedFieldType fieldType = super.getFieldType(name);
+                    // If it's a percolator field, wrap it with our own type
+                    // Pass originalContext so we can extract settings and sub-fields without reflection
+                    // (using 'this' would cause recursion when looking up sub-fields)
+                    if (fieldType != null && "percolator".equals(fieldType.typeName())) {
+                        return new org.elasticsearch.xpack.esql.querydsl.query.PercolatorFieldMapper.PercolatorFieldType(
+                            fieldType,
+                            originalContext
+                        );
+                    }
+                    return fieldType;
+                }
+            };
             return new LookupShardContext(
                 new EsPhysicalOperationProviders.DefaultShardContext(
                     0,
                     searchContext,
-                    searchContext.getSearchExecutionContext(),
+                    wrappedContext,
                     searchContext.request().getAliasFilter()
                 ),
-                searchContext.getSearchExecutionContext(),
+                wrappedContext,
                 searchContext
             );
         }
