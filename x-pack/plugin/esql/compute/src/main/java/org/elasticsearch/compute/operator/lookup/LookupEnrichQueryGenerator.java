@@ -27,4 +27,11 @@ public interface LookupEnrichQueryGenerator {
      */
     int getPositionCount();
 
+    /**
+     * Returns a BulkQueryList if applicable, null otherwise.
+     */
+    default DirectQueryProcessor getDirectQueryProcessor() {
+        return null;
+    }
+
 }

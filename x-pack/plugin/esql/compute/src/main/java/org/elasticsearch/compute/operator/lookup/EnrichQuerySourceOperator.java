@@ -88,6 +88,9 @@ public final class EnrichQuerySourceOperator extends SourceOperator {
             if (indexReader.leaves().size() > 1) {
                 segmentsBuilder = blockFactory.newIntVectorBuilder(estimatedSize);
             }
+            if (queryList.getDirectQueryProcessor() != null) {
+                return processDirectQueries(positionsBuilder, segmentsBuilder, docsBuilder);
+            }
             int totalMatches = 0;
             do {
                 Query query;
@@ -160,6 +163,31 @@ public final class EnrichQuerySourceOperator extends SourceOperator {
             }
         }
         return page;
+    }
+
+    private Page processDirectQueries(
+        IntVector.Builder positionsBuilder,
+        IntVector.Builder segmentsBuilder,
+        IntVector.Builder docsBuilder
+    ) {
+        DirectQueryProcessor directQueryProcessor = queryList.getDirectQueryProcessor();
+        int totalMatches = 0;
+        do {
+            queryPosition++;
+            if (queryPosition >= queryList.getPositionCount()) {
+                break;
+            }
+            int matches = directQueryProcessor.processQuery(
+                queryPosition,
+                indexReader,
+                docsBuilder,
+                segmentsBuilder,
+                positionsBuilder,
+                warnings
+            );
+            totalMatches += matches;
+        } while (totalMatches < maxPageSize);
+        return buildPage(totalMatches, positionsBuilder, segmentsBuilder, docsBuilder);
     }
 
     private Query nextQuery() {

@@ -129,10 +129,27 @@ public class LookupFromIndexService extends AbstractLookupService<LookupFromInde
             if (queryLists.size() == 1 && lookupNodePlan instanceof FilterExec == false) {
                 return queryLists.getFirst();
             }
-            return ExpressionQueryList.fieldBasedJoin(queryLists, context, lookupNodePlan, clusterService, aliasFilter);
+            return ExpressionQueryList.fieldBasedJoin(
+                queryLists,
+                context,
+                lookupNodePlan,
+                clusterService,
+                aliasFilter,
+                request.inputPage,
+                request.matchFields
+            );
         } else {
             // this is an expression based join
-            return ExpressionQueryList.expressionBasedJoin(context, lookupNodePlan, clusterService, request, aliasFilter, warnings);
+            return ExpressionQueryList.expressionBasedJoin(
+                context,
+                lookupNodePlan,
+                clusterService,
+                request,
+                aliasFilter,
+                warnings,
+                request.inputPage,
+                request.matchFields
+            );
         }
 
     }

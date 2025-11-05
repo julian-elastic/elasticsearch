@@ -10,10 +10,13 @@ package org.elasticsearch.xpack.esql.enrich;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.compute.data.Block;
+import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.Warnings;
+import org.elasticsearch.compute.operator.lookup.DirectQueryProcessor;
 import org.elasticsearch.compute.operator.lookup.LookupEnrichQueryGenerator;
 import org.elasticsearch.compute.operator.lookup.QueryList;
 import org.elasticsearch.index.mapper.MappedFieldType;
@@ -62,22 +65,30 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
     private final SearchExecutionContext context;
     private final AliasFilter aliasFilter;
     private final LucenePushdownPredicates lucenePushdownPredicates;
+    private final Page inputPage;
+    private final List<MatchConfig> matchFields;
+    private DirectQueryProcessor directQueryProcessor = null;
 
     private ExpressionQueryList(
         List<QueryList> queryLists,
         SearchExecutionContext context,
         PhysicalPlan rightPreJoinPlan,
         ClusterService clusterService,
-        AliasFilter aliasFilter
+        AliasFilter aliasFilter,
+        Page inputPage,
+        List<MatchConfig> matchFields
     ) {
         this.queryLists = new ArrayList<>(queryLists);
         this.context = context;
         this.aliasFilter = aliasFilter;
+        this.inputPage = inputPage;
+        this.matchFields = matchFields;
         this.lucenePushdownPredicates = LucenePushdownPredicates.from(
             SearchContextStats.from(List.of(context)),
             new EsqlFlags(clusterService.getClusterSettings())
         );
         buildPreJoinFilter(rightPreJoinPlan, clusterService);
+        initializeBulkWildcardMatchQueryList(clusterService);
     }
 
     /**
@@ -92,12 +103,14 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
         SearchExecutionContext context,
         PhysicalPlan rightPreJoinPlan,
         ClusterService clusterService,
-        AliasFilter aliasFilter
+        AliasFilter aliasFilter,
+        Page inputPage,
+        List<MatchConfig> matchFields
     ) {
         if (queryLists.size() < 2 && (rightPreJoinPlan instanceof FilterExec == false)) {
             throw new IllegalArgumentException("ExpressionQueryList must have at least two QueryLists or a pre-join filter");
         }
-        return new ExpressionQueryList(queryLists, context, rightPreJoinPlan, clusterService, aliasFilter);
+        return new ExpressionQueryList(queryLists, context, rightPreJoinPlan, clusterService, aliasFilter, inputPage, matchFields);
     }
 
     /**
@@ -114,7 +127,9 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
         ClusterService clusterService,
         LookupFromIndexService.TransportRequest request,
         AliasFilter aliasFilter,
-        Warnings warnings
+        Warnings warnings,
+        Page inputPage,
+        List<MatchConfig> matchFields
     ) {
         if (LOOKUP_JOIN_ON_BOOLEAN_EXPRESSION.isEnabled() == false) {
             throw new UnsupportedOperationException("Lookup Join on Boolean Expression capability is not enabled");
@@ -127,7 +142,9 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
             context,
             rightPreJoinPlan,
             clusterService,
-            aliasFilter
+            aliasFilter,
+            inputPage,
+            matchFields
         );
         expressionQueryList.buildJoinOnForExpressionJoin(
             request.getJoinOnConditions(),
@@ -270,21 +287,64 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
      */
     @Override
     public Query getQuery(int position) {
-        BooleanQuery.Builder builder = new BooleanQuery.Builder();
-        for (QueryList queryList : queryLists) {
-            Query q = queryList.getQuery(position);
-            if (q == null) {
-                // if any of the matchFields are null, it means there is no match for this position
-                // A AND NULL is always NULL, so we can skip this position
-                return null;
+        try {
+            // First verify the field exists and is of type percolator
+            MappedFieldType termQueryField = context.getFieldType("term_query_field");
+            MappedFieldType wildcardQueryField = context.getFieldType("wildcard_query_field");
+
+            if (termQueryField != null && wildcardQueryField != null) {
+
+                // Find folder_path field using matchFields to get the channel
+                // matchFields maps left-side field names to their channels in inputPage
+                Block folderPathBlock = null;
+                if (inputPage != null && matchFields != null) {
+                    for (MatchConfig matchField : matchFields) {
+                        if ("folder_path".equals(matchField.fieldName())) {
+                            int channel = matchField.channel();
+                            if (channel < inputPage.getBlockCount()) {
+                                folderPathBlock = inputPage.getBlock(channel);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // If folder_path block found, read the value at this position
+                String folderValue = null;
+                if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock bytesRefBlock) {
+                    if (position < bytesRefBlock.getPositionCount() && bytesRefBlock.isNull(position) == false) {
+                        BytesRef folderBytesRef = bytesRefBlock.getBytesRef(position, new BytesRef());
+                        folderValue = folderBytesRef.utf8ToString();
+                    }
+                }
+
+                // If we couldn't read folder_path, skip wildcard query
+                if (folderValue != null) {
+                    return new WildcardMatchQuery(folderValue, termQueryField, wildcardQueryField, context);
+                }
             }
-            builder.add(q, BooleanClause.Occur.FILTER);
+            BooleanQuery.Builder builder = new BooleanQuery.Builder();
+            for (QueryList queryList : queryLists) {
+                Query q = queryList.getQuery(position);
+                if (q == null) {
+                    // if any of the matchFields are null, it means there is no match for this position
+                    // A AND NULL is always NULL, so we can skip this position
+                    return null;
+                }
+                builder.add(q, BooleanClause.Occur.FILTER);
+            }
+            // also attach the pre-join filter if it exists
+            for (Query preJoinFilter : lucenePushableFilters) {
+                builder.add(preJoinFilter, BooleanClause.Occur.FILTER);
+            }
+            return builder.build();
+        } catch (Exception e) {
+            // If percolator query fails, throw to see what's wrong
+            throw new UncheckedIOException(
+                "Error while building percolator query with folder_path: " + e.getMessage(),
+                e instanceof IOException ? (IOException) e : new IOException(e)
+            );
         }
-        // also attach the pre-join filter if it exists
-        for (Query preJoinFilter : lucenePushableFilters) {
-            builder.add(preJoinFilter, BooleanClause.Occur.FILTER);
-        }
-        return builder.build();
     }
 
     /**
@@ -295,6 +355,9 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
      */
     @Override
     public int getPositionCount() {
+        if (directQueryProcessor != null) {
+            return directQueryProcessor.getPositionCount();
+        }
         int positionCount = queryLists.get(0).getPositionCount();
         for (QueryList queryList : queryLists) {
             if (queryList.getPositionCount() != positionCount) {
@@ -307,5 +370,53 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
             }
         }
         return positionCount;
+    }
+
+    @Override
+    public DirectQueryProcessor getDirectQueryProcessor() {
+        return directQueryProcessor;
+    }
+
+    /**
+     * Initializes the bulk wildcard match query list if wildcard matching is applicable.
+     * This checks if we have the necessary fields (term_query_field and wildcard_query_field)
+     * and a folder_path field in the match fields.
+     */
+    private void initializeBulkWildcardMatchQueryList(ClusterService clusterService) {
+        // Check if we have the required fields for wildcard matching
+        MappedFieldType termQueryField = context.getFieldType("term_query_field");
+        MappedFieldType wildcardQueryField = context.getFieldType("wildcard_query_field");
+
+        if (termQueryField == null || wildcardQueryField == null) {
+            return; // Not applicable for wildcard matching
+        }
+
+        // Find folder_path field using matchFields to get the channel
+        Block folderPathBlock = null;
+        if (inputPage != null && matchFields != null) {
+            for (MatchConfig matchField : matchFields) {
+                if ("folder_path".equals(matchField.fieldName())) {
+                    int channel = matchField.channel();
+                    if (channel < inputPage.getBlockCount()) {
+                        folderPathBlock = inputPage.getBlock(channel);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If folder_path block found, create bulk query list
+        if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock) {
+            // Use NOOP_WARNINGS for now - warnings will be handled by the operator
+            directQueryProcessor = new WildcardMatchDirectQueryProcessor(
+                termQueryField,
+                wildcardQueryField,
+                context,
+                folderPathBlock,
+                clusterService,
+                aliasFilter,
+                Warnings.NOOP_WARNINGS
+            );
+        }
     }
 }
