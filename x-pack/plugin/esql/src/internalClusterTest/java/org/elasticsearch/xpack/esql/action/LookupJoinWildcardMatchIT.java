@@ -49,6 +49,21 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
 
     private static final Logger logger = LogManager.getLogger(LookupJoinWildcardMatchIT.class);
 
+    /**
+     * Verification approach selection.
+     * TRIE: Uses a TRIE data structure for efficient prefix matching (faster for large datasets).
+     * BRUTE_FORCE: Uses nested loops to check all patterns against all folder paths (slower but simpler).
+     */
+    private enum VerificationApproach {
+        TRIE,
+        BRUTE_FORCE
+    }
+
+    /**
+     * Selects the verification approach. TRIE is enabled by default for better performance.
+     */
+    private static final VerificationApproach VERIFICATION_APPROACH = VerificationApproach.TRIE;
+
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         return List.of(
@@ -142,12 +157,6 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
      * Executes a wildcard match lookup join query and returns the results
      */
     private List<List<Object>> executeWildcardMatchJoinQuery(String mainIndex, String lookupIndex) {
-        // The join condition includes folder_path to trigger WildcardMatchQuery
-        // join_key_left == join_key_right provides the base join condition
-        // folder_path >= min_field ensures folder_path is in matchFields so WildcardMatchQuery can access it
-        // (this is always true since min_field is always "" and folder_path values are always non-empty strings)
-        // folder_path is used by WildcardMatchQuery to match against term_query_field and wildcard_query_field
-        // Use Integer.MAX_VALUE to override any default limits
         String query = String.format("""
             FROM %s
             | LOOKUP JOIN %s ON join_key_left == join_key_right AND folder_path >= min_field
@@ -157,6 +166,7 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
             | LIMIT %d
             """, mainIndex, lookupIndex, Integer.MAX_VALUE);
 
+        logger.info("Starting ESQL query execution");
         try (var response = EsqlQueryRequestBuilder.newRequestBuilder(client()).query(query).get()) {
             // Verify we have the expected columns
             assertThat(response.response().columns().size(), equalTo(6));
@@ -174,6 +184,7 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
                 iterator.forEach(row::add);
                 values.add(row);
             });
+            logger.info("Finished ESQL query execution, collected {} result rows", values.size());
             return values;
         }
     }
@@ -501,12 +512,12 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
         testWildcardMatchJoinWithRandomData(20_000, 20_000, 500);
     }
 
-    /*public void testWildcardMatchJoinRandomDataBig() throws Exception {
+    public void testWildcardMatchJoinRandomDataBig() throws Exception {
         testWildcardMatchJoinWithRandomData(100_000, 4_000, 4_000);
-    }*/
+    }
 
-    /*public void testWildcardMatchJoinRandomDataGiantExact() throws Exception {
-        testWildcardMatchJoinWithRandomData(100_000, 100_000, 0);
+    /*public void testWildcardMatchJoinRandomDataGiant() throws Exception {
+        testWildcardMatchJoinWithRandomData(100_000, 100_000, 4_000);
     }*/
 
     public void testWildcardMatchJoinEmptyLeftIndex() throws Exception {
@@ -609,11 +620,122 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
     }
 
     /**
-     * Helper method to test wildcard match join with specified number of rows.
-     * @param leftRows Number of rows in the left (main) index
-     * @param rightExactRows Number of exact match rows in the right (lookup) index
-     * @param rightWildcardRows Number of wildcard match rows in the right (lookup) index
+     * Generates exact match patterns for the right index.
+     *
+     * @param leftFolderPaths List of folder paths from left index (used as source for some patterns)
+     * @param count Number of exact match patterns to generate
+     * @param startId Starting pattern ID
+     * @param copyProbability Percentage (0-100) probability to copy an existing pattern instead of creating new
+     * @return List of generated PatternInfo objects with sequential IDs starting from startId
      */
+    private List<PatternInfo> generateExactMatchPatterns(List<String> leftFolderPaths, int count, int startId, int copyProbability) {
+        List<PatternInfo> patterns = new ArrayList<>();
+        List<PatternInfo> existingExactPatterns = new ArrayList<>();
+        int patternId = startId;
+
+        for (int i = 0; i < count; i++) {
+            PatternInfo pattern;
+
+            // Check if we should copy an existing exact pattern
+            if (randomIntBetween(1, 100) <= copyProbability && existingExactPatterns.isEmpty() == false) {
+                // Copy an existing exact pattern
+                PatternInfo existingPattern = existingExactPatterns.get(randomIntBetween(0, existingExactPatterns.size() - 1));
+                pattern = new PatternInfo(patternId++, existingPattern.folderPattern, existingPattern.termField, null);
+                existingExactPatterns.add(pattern);
+            } else {
+                // Create a new exact match pattern
+                if (randomBoolean()) {
+                    // 50%: Pick an exact existing pattern (use an existing left folder path)
+                    String existingPath = leftFolderPaths.get(randomIntBetween(0, leftFolderPaths.size() - 1));
+                    pattern = new PatternInfo(patternId++, existingPath, existingPath, null);
+                } else {
+                    // 50%: Random string exact match
+                    String patternValue = randomAlphanumericOfLengthBetween(1, 20);
+                    pattern = new PatternInfo(patternId++, patternValue, patternValue, null);
+                }
+                existingExactPatterns.add(pattern);
+            }
+            patterns.add(pattern);
+        }
+
+        return patterns;
+    }
+
+    /**
+     * Generates wildcard match patterns for the right index.
+     *
+     * @param leftFolderPaths List of folder paths from left index (used as source for some patterns)
+     * @param count Number of wildcard patterns to generate
+     * @param startId Starting pattern ID
+     * @param copyProbability Percentage (0-100) probability to copy an existing wildcard pattern instead of creating new
+     * @return List of generated PatternInfo objects with sequential IDs starting from startId
+     */
+    private List<PatternInfo> generateWildcardPatterns(List<String> leftFolderPaths, int count, int startId, int copyProbability) {
+        List<PatternInfo> patterns = new ArrayList<>();
+
+        // With 50% probability, insert a "*" pattern (matches everything)
+        // This is independent of other pattern generation
+        if (randomBoolean()) {
+            patterns.add(new PatternInfo(startId++, "*", null, ""));
+        }
+
+        // Track existing wildcard patterns for copying (built as we generate)
+        List<PatternInfo> existingWildcardPatterns = new ArrayList<>();
+        int patternId = startId;
+
+        for (int i = 0; i < count; i++) {
+            PatternInfo pattern;
+
+            // Check if we should copy an existing wildcard pattern
+            if (randomIntBetween(1, 100) <= copyProbability && existingWildcardPatterns.isEmpty() == false) {
+                // Copy an existing wildcard pattern
+                PatternInfo existingPattern = existingWildcardPatterns.get(randomIntBetween(0, existingWildcardPatterns.size() - 1));
+                pattern = new PatternInfo(patternId++, existingPattern.folderPattern, null, existingPattern.wildcardField);
+                existingWildcardPatterns.add(pattern);
+            } else {
+                // Create a new wildcard pattern
+                int patternType = randomIntBetween(0, 2);
+
+                if (patternType == 0) {
+                    // 33%: Pick a substring of existing pattern, then make it wildcard
+                    String existingPath = leftFolderPaths.get(randomIntBetween(0, leftFolderPaths.size() - 1));
+                    if (existingPath.length() > 0) {
+                        // Pick a random substring of the existing path
+                        int startPos = randomIntBetween(0, Math.max(0, existingPath.length() - 1));
+                        int endPos = randomIntBetween(startPos + 1, existingPath.length());
+                        String substring = existingPath.substring(startPos, endPos);
+                        pattern = new PatternInfo(patternId++, substring + "*", null, substring);
+                    } else {
+                        // Fallback if path is empty
+                        String patternValue = randomAlphanumericOfLengthBetween(1, 20);
+                        pattern = new PatternInfo(patternId++, patternValue + "*", null, patternValue);
+                    }
+                } else if (patternType == 1) {
+                    // 33%: Random pattern wildcard
+                    String patternValue = randomAlphanumericOfLengthBetween(1, 20);
+                    pattern = new PatternInfo(patternId++, patternValue + "*", null, patternValue);
+                } else {
+                    // 33%: Prefix substring wildcard (prefix of existing path with wildcard)
+                    String existingPath = leftFolderPaths.get(randomIntBetween(0, leftFolderPaths.size() - 1));
+                    if (existingPath.length() > 0) {
+                        // Pick a prefix substring of the existing path (starting from position 0)
+                        int prefixLength = randomIntBetween(1, existingPath.length());
+                        String prefix = existingPath.substring(0, prefixLength);
+                        pattern = new PatternInfo(patternId++, prefix + "*", null, prefix);
+                    } else {
+                        // Fallback if path is empty
+                        String patternValue = randomAlphanumericOfLengthBetween(1, 20);
+                        pattern = new PatternInfo(patternId++, patternValue + "*", null, patternValue);
+                    }
+                }
+                existingWildcardPatterns.add(pattern);
+            }
+            patterns.add(pattern);
+        }
+
+        return patterns;
+    }
+
     private void testWildcardMatchJoinWithRandomData(int leftRows, int rightExactRows, int rightWildcardRows) throws Exception {
         String mainIndex = "test_left_random";
         String lookupIndex = "test_right_random";
@@ -634,65 +756,20 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
             throw new IllegalArgumentException("leftFolderPaths cannot be empty");
         }
 
-        // Generate exact match patterns for right index
+        // Generate patterns for right index
         List<PatternInfo> rightPatterns = new ArrayList<>();
         int patternId = 0;
 
         // Generate exact match patterns (50% from existing left paths, 50% random strings)
-        for (int i = 0; i < rightExactRows; i++) {
-            PatternInfo pattern;
-            if (randomBoolean()) {
-                // 50%: Pick an exact existing pattern (use an existing left folder path)
-                String existingPath = leftFolderPaths.get(randomIntBetween(0, leftFolderPaths.size() - 1));
-                pattern = new PatternInfo(patternId++, existingPath, existingPath, null);
-            } else {
-                // 50%: Random string exact match
-                String patternValue = randomAlphanumericOfLengthBetween(1, 20);
-                pattern = new PatternInfo(patternId++, patternValue, patternValue, null);
-            }
-            rightPatterns.add(pattern);
-        }
+        // 10% probability to copy existing patterns (to test duplicate patterns)
+        List<PatternInfo> exactPatterns = generateExactMatchPatterns(leftFolderPaths, rightExactRows, patternId, 10);
+        rightPatterns.addAll(exactPatterns);
+        patternId += exactPatterns.size();
 
-        // Generate wildcard match patterns for right index
-        // Mix of: substring wildcard from existing paths, random string wildcard, prefix wildcard
-        for (int i = 0; i < rightWildcardRows; i++) {
-            PatternInfo pattern;
-            int patternType = randomIntBetween(0, 2);
-
-            if (patternType == 0) {
-                // 33%: Pick a substring of existing pattern, then make it wildcard
-                String existingPath = leftFolderPaths.get(randomIntBetween(0, leftFolderPaths.size() - 1));
-                if (existingPath.length() > 0) {
-                    // Pick a random substring of the existing path
-                    int startPos = randomIntBetween(0, Math.max(0, existingPath.length() - 1));
-                    int endPos = randomIntBetween(startPos + 1, existingPath.length());
-                    String substring = existingPath.substring(startPos, endPos);
-                    pattern = new PatternInfo(patternId++, substring + "*", null, substring);
-                } else {
-                    // Fallback if path is empty
-                    String patternValue = randomAlphanumericOfLengthBetween(1, 20);
-                    pattern = new PatternInfo(patternId++, patternValue + "*", null, patternValue);
-                }
-            } else if (patternType == 1) {
-                // 33%: Random pattern wildcard
-                String patternValue = randomAlphanumericOfLengthBetween(1, 20);
-                pattern = new PatternInfo(patternId++, patternValue + "*", null, patternValue);
-            } else {
-                // 33%: Prefix substring wildcard (prefix of existing path with wildcard)
-                String existingPath = leftFolderPaths.get(randomIntBetween(0, leftFolderPaths.size() - 1));
-                if (existingPath.length() > 0) {
-                    // Pick a prefix substring of the existing path (starting from position 0)
-                    int prefixLength = randomIntBetween(1, existingPath.length());
-                    String prefix = existingPath.substring(0, prefixLength);
-                    pattern = new PatternInfo(patternId++, prefix + "*", null, prefix);
-                } else {
-                    // Fallback if path is empty
-                    String patternValue = randomAlphanumericOfLengthBetween(1, 20);
-                    pattern = new PatternInfo(patternId++, patternValue + "*", null, patternValue);
-                }
-            }
-            rightPatterns.add(pattern);
-        }
+        // Generate wildcard match patterns
+        // 10% probability to copy an existing wildcard pattern (to test duplicate patterns)
+        List<PatternInfo> wildcardPatterns = generateWildcardPatterns(leftFolderPaths, rightWildcardRows, patternId, 10);
+        rightPatterns.addAll(wildcardPatterns);
 
         // Index data from patterns
         logger.info("Starting to populate main index '{}' with {} documents", mainIndex, leftFolderPaths.size());
@@ -721,37 +798,7 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
 
         try {
             // Execute query with WHERE filter to get only matched rows
-            // Use Integer.MAX_VALUE to override any default limits
-            String query = String.format("""
-                FROM %s
-                | LOOKUP JOIN %s ON join_key_left == join_key_right AND folder_path >= min_field
-                | WHERE join_key_right IS NOT NULL
-                | KEEP folder_path, folder, join_key_right, filter_field_kw, term_query_field, wildcard_query_field
-                | SORT folder_path, term_query_field, wildcard_query_field
-                | LIMIT %d
-                """, mainIndex, lookupIndex, Integer.MAX_VALUE);
-
-            logger.info("Starting ESQL query execution");
-            List<List<Object>> values;
-            try (var response = EsqlQueryRequestBuilder.newRequestBuilder(client()).query(query).get()) {
-                // Verify we have the expected columns
-                assertThat(response.response().columns().size(), equalTo(6));
-                assertThat(response.response().columns().get(0).name(), equalTo("folder_path"));
-                assertThat(response.response().columns().get(1).name(), equalTo("folder"));
-                assertThat(response.response().columns().get(2).name(), equalTo("join_key_right"));
-                assertThat(response.response().columns().get(3).name(), equalTo("filter_field_kw"));
-                assertThat(response.response().columns().get(4).name(), equalTo("term_query_field"));
-                assertThat(response.response().columns().get(5).name(), equalTo("wildcard_query_field"));
-
-                // Collect the results
-                values = new ArrayList<>();
-                response.response().rows().forEach(iterator -> {
-                    List<Object> row = new ArrayList<>();
-                    iterator.forEach(row::add);
-                    values.add(row);
-                });
-            }
-            logger.info("Finished ESQL query execution, collected {} result rows", values.size());
+            List<List<Object>> values = executeWildcardMatchJoinQuery(mainIndex, lookupIndex);
 
             // Use the shared verification algorithm
             logger.info("Starting result validation");
@@ -777,7 +824,6 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
         String mainIndex = "test_left_debug";
         String lookupIndex = "test_right_debug";
 
-        // Define folder paths and patterns
         List<String> leftFolderPaths = Arrays.asList("folder2.folder11");
 
         List<PatternInfo> rightPatterns = Arrays.asList(
@@ -806,6 +852,49 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
     }
 
     /**
+     * Test case that reproduces the issue where findMatchingPrefixTerms skips matching terms.
+     *
+     * Scenario:
+     * - Search value: "abc"
+     * - Wildcard terms: "a*", "ab*", "abc*"
+     * - All three should match "abc"
+     * - Bug: When we find "a*" at prefixLength=1, we advance to prefixLength=3 (foundTerm.length + 1 = 2 + 1)
+     *   This skips checking "ab*" which should also match
+     * - Fix: Should advance to prefixLength=2 (foundTerm.length) since the * doesn't count for prefix length
+     */
+    public void testWildcardMatchJoinSkipsTerms() throws Exception {
+        String mainIndex = "test_left_skip";
+        String lookupIndex = "test_right_skip";
+
+        // Define folder paths and patterns
+        List<String> leftFolderPaths = Arrays.asList("abc");
+
+        List<PatternInfo> rightPatterns = Arrays.asList(
+            new PatternInfo(1, "a*", null, "a"),                   // Pattern 1: a* (prefix)
+            new PatternInfo(2, "ab*", null, "ab"),                 // Pattern 2: ab* (prefix) - This gets skipped!
+            new PatternInfo(3, "abc*", null, "abc")                 // Pattern 3: abc* (prefix)
+        );
+
+        // Create indices
+        createMainIndex(mainIndex);
+        createLookupIndex(lookupIndex);
+
+        // Index test data from patterns
+        indexMainDataFromPaths(mainIndex, leftFolderPaths);
+        indexLookupDataFromPatterns(lookupIndex, rightPatterns);
+
+        // Refresh indices and verify counts
+        refreshAndVerifyCounts(mainIndex, leftFolderPaths.size(), lookupIndex, rightPatterns.size());
+
+        // Execute query and get results
+        List<List<Object>> values = executeWildcardMatchJoinQuery(mainIndex, lookupIndex);
+
+        // Use the shared verification algorithm
+        // This should fail with the bug: expects 3 matches but only finds 2 (missing "ab*")
+        verifyMatches(leftFolderPaths, rightPatterns, values);
+    }
+
+    /**
      * Verifies that query results match expected matches based on folder paths and patterns.
      * This is the core verification algorithm used by all tests.
      *
@@ -814,6 +903,216 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
      * @param values Query results from ESQL query
      */
     private void verifyMatches(List<String> leftFolderPaths, List<PatternInfo> rightPatterns, List<List<Object>> values) {
+        if (VERIFICATION_APPROACH == VerificationApproach.TRIE) {
+            verifyMatchesWithTrie(leftFolderPaths, rightPatterns, values);
+        } else {
+            verifyMatchesBruteForce(leftFolderPaths, rightPatterns, values);
+        }
+    }
+
+    /**
+     * Verifies matches using a TRIE data structure for efficient prefix matching.
+     * This approach is faster for large datasets as it avoids nested loops.
+     *
+     * @param leftFolderPaths List of folder paths from left index (may contain duplicates)
+     * @param rightPatterns List of patterns from right index
+     * @param values Query results from ESQL query
+     */
+    private void verifyMatchesWithTrie(List<String> leftFolderPaths, List<PatternInfo> rightPatterns, List<List<Object>> values) {
+        // First, count how many times each folder path appears in leftFolderPaths
+        Map<String, Integer> folderPathCounts = new HashMap<>();
+        for (String folderPath : leftFolderPaths) {
+            folderPathCounts.put(folderPath, folderPathCounts.getOrDefault(folderPath, 0) + 1);
+        }
+
+        // Build TRIE for wildcard patterns and exact match map for term patterns
+        PatternTrie wildcardTrie = new PatternTrie();
+        Map<String, List<PatternInfo>> exactMatchMap = new HashMap<>();
+
+        for (PatternInfo pattern : rightPatterns) {
+            if (pattern.termField != null) {
+                exactMatchMap.computeIfAbsent(pattern.termField, k -> new ArrayList<>()).add(pattern);
+            }
+            if (pattern.wildcardField != null) {
+                wildcardTrie.insert(pattern.wildcardField, pattern);
+            }
+        }
+
+        // For each unique folder path, find all patterns that match it using TRIE
+        Map<String, List<Match>> matchesPerFolderPath = new HashMap<>();
+        for (String folderPath : folderPathCounts.keySet()) {
+            Set<Integer> addedPatternIds = new HashSet<>();
+            List<Match> matches = new ArrayList<>();
+
+            // Check exact matches
+            List<PatternInfo> exactMatches = exactMatchMap.get(folderPath);
+            if (exactMatches != null) {
+                for (PatternInfo pattern : exactMatches) {
+                    matches.add(new Match(pattern.termField, null));
+                    addedPatternIds.add(pattern.id);
+                }
+            }
+
+            // Check wildcard matches using TRIE
+            List<PatternInfo> wildcardMatches = wildcardTrie.findAllMatchingPrefixes(folderPath);
+            for (PatternInfo pattern : wildcardMatches) {
+                if (addedPatternIds.contains(pattern.id) == false) {
+                    matches.add(new Match(null, pattern.wildcardField));
+                    addedPatternIds.add(pattern.id);
+                }
+            }
+
+            // Only add entries that have matches (unmatched rows are filtered out by WHERE clause)
+            if (matches.isEmpty() == false) {
+                matchesPerFolderPath.put(folderPath, matches);
+            }
+        }
+
+        // Build expected matches accounting for duplicate folder paths
+        // Each occurrence of a folder path in leftFolderPaths creates a separate row in results
+        Map<String, List<Match>> expectedMatches = new HashMap<>();
+        for (Map.Entry<String, List<Match>> entry : matchesPerFolderPath.entrySet()) {
+            String folderPath = entry.getKey();
+            List<Match> matches = entry.getValue();
+            int count = folderPathCounts.get(folderPath);
+            // Multiply matches by the number of times this folder path appears
+            // Each occurrence gets the same matches
+            List<Match> allMatches = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                allMatches.addAll(matches);
+            }
+            // Sort matches for consistent comparison
+            allMatches.sort(Match.COMPARATOR);
+            expectedMatches.put(folderPath, allMatches);
+        }
+
+        // Calculate expected total number of result rows (sum of all matches)
+        int expectedTotalRows = expectedMatches.values().stream().mapToInt(List::size).sum();
+
+        // Build actual results map
+        Map<String, List<Match>> actualMatches = new HashMap<>();
+        for (List<Object> row : values) {
+            String folderPath = (String) row.get(0);
+            String termField = (String) row.get(4);
+            String wildcardField = (String) row.get(5);
+            actualMatches.computeIfAbsent(folderPath, k -> new ArrayList<>()).add(new Match(termField, wildcardField));
+        }
+
+        // Sort matches for consistent comparison
+        for (List<Match> matches : actualMatches.values()) {
+            matches.sort(Match.COMPARATOR);
+        }
+
+        // Collect differences before assertions
+        List<String> missingMatches = new ArrayList<>();
+        List<String> extraMatches = new ArrayList<>();
+
+        // Check for missing matches (in expected but not in actual)
+        for (Map.Entry<String, List<Match>> entry : expectedMatches.entrySet()) {
+            String folderPath = entry.getKey();
+            List<Match> expected = entry.getValue();
+            List<Match> actual = actualMatches.get(folderPath);
+
+            if (actual == null) {
+                for (Match match : expected) {
+                    missingMatches.add(
+                        String.format(
+                            "Missing: folderPath=%s, termField=%s, wildcardField=%s",
+                            folderPath,
+                            match.termField,
+                            match.wildcardField
+                        )
+                    );
+                }
+            } else {
+                // Create copies to avoid modifying originals
+                List<Match> expectedCopy = new ArrayList<>(expected);
+                List<Match> actualCopy = new ArrayList<>(actual);
+
+                // Find matches in expected but not in actual
+                for (Match expectedMatch : expected) {
+                    if (actualCopy.remove(expectedMatch) == false) {
+                        missingMatches.add(
+                            String.format(
+                                "Missing: folderPath=%s, termField=%s, wildcardField=%s",
+                                folderPath,
+                                expectedMatch.termField,
+                                expectedMatch.wildcardField
+                            )
+                        );
+                    }
+                }
+
+                // Remaining in actualCopy are extra matches
+                for (Match extraMatch : actualCopy) {
+                    extraMatches.add(
+                        String.format(
+                            "Extra: folderPath=%s, termField=%s, wildcardField=%s",
+                            folderPath,
+                            extraMatch.termField,
+                            extraMatch.wildcardField
+                        )
+                    );
+                }
+            }
+        }
+
+        // Check for extra folder paths (in actual but not in expected)
+        for (Map.Entry<String, List<Match>> entry : actualMatches.entrySet()) {
+            String folderPath = entry.getKey();
+            if (expectedMatches.containsKey(folderPath) == false) {
+                for (Match match : entry.getValue()) {
+                    extraMatches.add(
+                        String.format(
+                            "Extra: folderPath=%s, termField=%s, wildcardField=%s",
+                            folderPath,
+                            match.termField,
+                            match.wildcardField
+                        )
+                    );
+                }
+            }
+        }
+
+        // Print first 10 differences
+        if (missingMatches.isEmpty() == false || extraMatches.isEmpty() == false) {
+            logger.error("Found mismatches. First 10 missing matches:");
+            for (int i = 0; i < Math.min(10, missingMatches.size()); i++) {
+                logger.error("  {}", missingMatches.get(i));
+            }
+            logger.error("First 10 extra matches:");
+            for (int i = 0; i < Math.min(10, extraMatches.size()); i++) {
+                logger.error("  {}", extraMatches.get(i));
+            }
+        }
+
+        // Verify total number of result rows equals expected total matches
+        assertThat("Total number of result rows should equal expected total matches", values.size(), equalTo(expectedTotalRows));
+
+        // Verify only matched folder paths are present in results
+        assertThat("Only matched folder paths should be present in results", actualMatches.size(), equalTo(expectedMatches.size()));
+
+        // Compare expected vs actual for each folder path
+        // Note: Since we've already verified sizes match, checking all expected entries ensures no unexpected entries exist
+        for (Map.Entry<String, List<Match>> entry : expectedMatches.entrySet()) {
+            String folderPath = entry.getKey();
+            List<Match> expected = entry.getValue();
+            List<Match> actual = actualMatches.get(folderPath);
+
+            assertThat("Folder path " + folderPath + " should be present in results", actual != null, equalTo(true));
+            assertThat("Matches for folder path " + folderPath + " should match expected", actual, equalTo(expected));
+        }
+    }
+
+    /**
+     * Verifies matches using brute force nested loops (original implementation).
+     * This approach is simpler but slower for large datasets.
+     *
+     * @param leftFolderPaths List of folder paths from left index (may contain duplicates)
+     * @param rightPatterns List of patterns from right index
+     * @param values Query results from ESQL query
+     */
+    private void verifyMatchesBruteForce(List<String> leftFolderPaths, List<PatternInfo> rightPatterns, List<List<Object>> values) {
         // First, count how many times each folder path appears in leftFolderPaths
         Map<String, Integer> folderPathCounts = new HashMap<>();
         for (String folderPath : leftFolderPaths) {
@@ -929,6 +1228,71 @@ public class LookupJoinWildcardMatchIT extends ESIntegTestCase {
             TimeValue.timeValueSeconds(30)
         ).persistentSettings(clearedSettings.build());
         client().admin().cluster().updateSettings(clearSettingsRequest).actionGet();
+    }
+
+    /**
+     * TRIE data structure for efficient prefix matching of wildcard patterns.
+     */
+    private static class PatternTrie {
+        private final TrieNode root = new TrieNode();
+
+        void insert(String prefix, PatternInfo pattern) {
+            TrieNode current = root;
+            for (int i = 0; i < prefix.length(); i++) {
+                char c = prefix.charAt(i);
+                current = current.children.computeIfAbsent(c, k -> new TrieNode());
+            }
+            if (current.patterns == null) {
+                current.patterns = new ArrayList<>();
+            }
+            current.patterns.add(pattern);
+        }
+
+        /**
+         * Find all prefix patterns that match the given string.
+         * A prefix pattern matches if the string starts with the prefix.
+         * Special case: empty prefix ("") matches everything.
+         *
+         * @param str The string to match against (e.g., a folder path)
+         * @return List of all matching patterns
+         */
+        List<PatternInfo> findAllMatchingPrefixes(String str) {
+            List<PatternInfo> results = new ArrayList<>();
+
+            // Special case: empty prefix ("*" pattern) matches everything
+            // Check root node first for empty prefix patterns
+            if (root.patterns != null) {
+                results.addAll(root.patterns);
+            }
+
+            TrieNode current = root;
+
+            // Traverse the TRIE following the string characters
+            for (int i = 0; i < str.length(); i++) {
+                char c = str.charAt(i);
+                TrieNode next = current.children.get(c);
+                if (next == null) {
+                    // No more matching prefixes
+                    break;
+                }
+                current = next;
+
+                // Collect all patterns at this node (prefixes that match up to this point)
+                if (current.patterns != null) {
+                    results.addAll(current.patterns);
+                }
+            }
+
+            return results;
+        }
+
+        /**
+         * TRIE node representing a character in the prefix tree.
+         */
+        private static class TrieNode {
+            Map<Character, TrieNode> children = new HashMap<>();
+            List<PatternInfo> patterns = null;  // Patterns matching this prefix (null if not a complete prefix)
+        }
     }
 
     /**

@@ -74,15 +74,16 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
     private DirectQueryProcessor directQueryProcessor = null;
 
     public enum Approach {
-        WILDCARD_MATCH_DIRECT,
-        WILDCARD_MATCH_QUERY,
-        WILDCARD_MATCH_SINGLE_COLUMN,
-        PERCOLATOR_QUERY,
-        IN_MEMORY_PREFIX_BASIC,
-        IN_MEMORY_PREFIX_TRIE
+        WILDCARD_MATCH_DIRECT, // Bulk Wildcard Match using two fields
+        WILDCARD_MATCH_QUERY, // Query Wildcard Match using two fields
+        WILDCARD_MATCH_SINGLE_COLUMN_DIRECT, // Bulk Wildcard Match using single field
+        WILDCARD_MATCH_SINGLE_COLUMN_QUERY, // Query Wildcard Match using single field
+        PERCOLATOR_QUERY, // Using a single percolator field to do the match (very slow)
+        IN_MEMORY_PREFIX_BASIC, // In-Memory Prefix Match using basic approach (very slow) O(m*n)
+        IN_MEMORY_PREFIX_TRIE // In-Memory Prefix Match using trie approach (still slow, builds tree for every page) O(m log n)
     }
 
-    private Approach approach = Approach.IN_MEMORY_PREFIX_TRIE;
+    private Approach approach = Approach.WILDCARD_MATCH_SINGLE_COLUMN_QUERY;
 
     private ExpressionQueryList(
         List<QueryList> queryLists,
@@ -105,6 +106,8 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
         buildPreJoinFilter(rightPreJoinPlan, clusterService);
         if (approach == Approach.WILDCARD_MATCH_DIRECT) {
             initializeBulkWildcardMatchQueryList(clusterService);
+        } else if (approach == Approach.WILDCARD_MATCH_SINGLE_COLUMN_DIRECT) {
+            initializeWildcardMatchSingleColumnQueryList(clusterService);
         } else if (approach == Approach.IN_MEMORY_PREFIX_BASIC || approach == Approach.IN_MEMORY_PREFIX_TRIE) {
             initializeInMemoryPrefixQueryList(clusterService);
         }
@@ -342,6 +345,11 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
                 if (q != null) {
                     return q;
                 }
+            } else if (approach == Approach.WILDCARD_MATCH_SINGLE_COLUMN_QUERY) {
+                WildcardMatchSingleColumnQuery q = applyAsWildcardMatchSingleColumnQuery(position);
+                if (q != null) {
+                    return q;
+                }
             } else if (approach == Approach.PERCOLATOR_QUERY) {
                 Query q = applyAsPerculatorQuery(position);
                 if (q != null) {
@@ -407,6 +415,43 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
             // If we couldn't read folder_path, skip wildcard query
             if (folderValue != null) {
                 return new WildcardMatchQuery(folderValue, termQueryField, wildcardQueryField, context);
+            }
+        }
+        return null;
+    }
+
+    private WildcardMatchSingleColumnQuery applyAsWildcardMatchSingleColumnQuery(int position) {
+        // First verify the folder field exists
+        MappedFieldType folderField = context.getFieldType("folder");
+
+        if (folderField != null) {
+            // Find folder_path field using matchFields to get the channel
+            // matchFields maps left-side field names to their channels in inputPage
+            Block folderPathBlock = null;
+            if (inputPage != null && matchFields != null) {
+                for (MatchConfig matchField : matchFields) {
+                    if ("folder_path".equals(matchField.fieldName())) {
+                        int channel = matchField.channel();
+                        if (channel < inputPage.getBlockCount()) {
+                            folderPathBlock = inputPage.getBlock(channel);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // If folder_path block found, read the value at this position
+            String folderValue = null;
+            if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock bytesRefBlock) {
+                if (position < bytesRefBlock.getPositionCount() && bytesRefBlock.isNull(position) == false) {
+                    BytesRef folderBytesRef = bytesRefBlock.getBytesRef(position, new BytesRef());
+                    folderValue = folderBytesRef.utf8ToString();
+                }
+            }
+
+            // If we couldn't read folder_path, skip wildcard query
+            if (folderValue != null) {
+                return new WildcardMatchSingleColumnQuery(folderValue, folderField, context);
             }
         }
         return null;
@@ -528,6 +573,44 @@ public class ExpressionQueryList implements LookupEnrichQueryGenerator {
                 folderPathBlock,
                 clusterService,
                 aliasFilter,
+                Warnings.NOOP_WARNINGS
+            );
+        }
+    }
+
+    /**
+     * Initializes the wildcard match single column query list if wildcard matching is applicable.
+     * This checks if we have the folder field and a folder_path field in the match fields.
+     */
+    private void initializeWildcardMatchSingleColumnQueryList(ClusterService clusterService) {
+        // Check if we have the folder field
+        MappedFieldType folderField = context.getFieldType("folder");
+
+        if (folderField == null) {
+            return; // Not applicable for wildcard matching
+        }
+
+        // Find folder_path field using matchFields to get the channel
+        Block folderPathBlock = null;
+        if (inputPage != null && matchFields != null) {
+            for (MatchConfig matchField : matchFields) {
+                if ("folder_path".equals(matchField.fieldName())) {
+                    int channel = matchField.channel();
+                    if (channel < inputPage.getBlockCount()) {
+                        folderPathBlock = inputPage.getBlock(channel);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If folder_path block found, create direct query processor
+        if (folderPathBlock != null && folderPathBlock instanceof BytesRefBlock) {
+            // Use NOOP_WARNINGS for now - warnings will be handled by the operator
+            directQueryProcessor = new WildcardMatchSingleColumnDirectQueryProcessor(
+                folderField,
+                context,
+                folderPathBlock,
                 Warnings.NOOP_WARNINGS
             );
         }
