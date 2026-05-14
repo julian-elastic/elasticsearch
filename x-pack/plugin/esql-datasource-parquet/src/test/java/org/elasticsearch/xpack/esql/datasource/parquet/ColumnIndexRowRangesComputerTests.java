@@ -15,6 +15,8 @@ import org.apache.parquet.format.OffsetIndex;
 import org.apache.parquet.format.PageLocation;
 import org.apache.parquet.format.converter.ParquetMetadataConverter;
 import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
+import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Types;
 import org.elasticsearch.test.ESTestCase;
@@ -367,6 +369,89 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         assertTrue("All-NaN page must be kept conservatively", result.overlaps(2L * PAGE_SIZE, 3L * PAGE_SIZE));
     }
 
+    // -----------------------------------------------------------------------------------
+    // Schema-driven decode: FLOAT vs DOUBLE disambiguation and conservative reject for
+    // non-native DOUBLE backings (DECIMAL, Float16). Today's decodeValue uses
+    // `ordered.remaining() == Float.BYTES` to pick the reader, which is correct for
+    // well-formed FLOAT/DOUBLE files but misreads any column whose physical encoding is
+    // not 4-byte float or 8-byte double. The schema-driven path replaces the
+    // heuristic with a lookup against the file MessageType captured on PreloadedRowGroupMetadata.
+    // -----------------------------------------------------------------------------------
+
+    public void testFloatColumnDecodedViaFloatBuffers() {
+        // No-regression guard: a real FLOAT column with 4-byte stats and a `Lt(0.5)` predicate
+        // whose min/max clearly satisfy the predicate. The page must be kept both under today's
+        // buffer-length heuristic and under the schema-driven decode in Phase B.
+        PrimitiveType ptype = Types.required(PrimitiveType.PrimitiveTypeName.FLOAT).named("score");
+        ByteBuffer min = ByteBuffer.allocate(Float.BYTES).order(ByteOrder.LITTLE_ENDIAN).putFloat(-10.0f).flip();
+        ByteBuffer max = ByteBuffer.allocate(Float.BYTES).order(ByteOrder.LITTLE_ENDIAN).putFloat(-1.0f).flip();
+        PreloadedRowGroupMetadata metadata = buildSinglePageMetadata("score", ptype, min, max, PAGE_SIZE);
+        FilterPredicate pred = FilterApi.lt(FilterApi.doubleColumn("score"), 0.5);
+
+        RowRanges result = ColumnIndexRowRangesComputer.compute(pred, metadata, 0, PAGE_SIZE);
+
+        assertTrue("FLOAT-encoded page satisfying Lt(0.5) must be included", result.overlaps(0, PAGE_SIZE));
+    }
+
+    public void testDoubleColumnDecodedViaDoubleBuffers() {
+        // No-regression guard: a real DOUBLE column with 8-byte stats and a `Lt(0.5)` predicate
+        // whose min/max clearly fail the predicate. The page must be excluded both under today's
+        // buffer-length heuristic and under the schema-driven decode in Phase B.
+        PrimitiveType ptype = Types.required(PrimitiveType.PrimitiveTypeName.DOUBLE).named("score");
+        PreloadedRowGroupMetadata metadata = buildSinglePageMetadata("score", ptype, doubleToBuffer(10.0), doubleToBuffer(15.0), PAGE_SIZE);
+        FilterPredicate pred = FilterApi.lt(FilterApi.doubleColumn("score"), 0.5);
+
+        RowRanges result = ColumnIndexRowRangesComputer.compute(pred, metadata, 0, PAGE_SIZE);
+
+        assertFalse("DOUBLE-encoded page failing Lt(0.5) must be excluded", result.overlaps(0, PAGE_SIZE));
+    }
+
+    public void testDecimalEncodedDoubleColumnIsKeptConservatively() {
+        // INT32-encoded DECIMAL column with scale=2 (cents). Stats represent $10.00 (min=1000)
+        // and $5000.00 (max=500000). The predicate `Gt(price, 100.0)` should keep the page —
+        // RECHECK in FilterExec evaluates the actual decoded values per row.
+        //
+        // Today's decodeValue Double branch matches `ordered.remaining() == Float.BYTES` (4 for
+        // INT32) and reinterprets the int bits as a float via getFloat():
+        // Float.intBitsToFloat(500000) is approximately 7.0e-40, a tiny denormal.
+        // The leaf lambda for Gt then evaluates `max > 100.0` -> 7.0e-40 > 100 -> false, and
+        // the page is WRONGLY EXCLUDED. Phase B detects the DECIMAL logical-type via the
+        // schema and returns null from decodeValue, routing the page through the conservative
+        // null branch. Fails today, passes after Phase B.
+        PrimitiveType ptype = Types.required(PrimitiveType.PrimitiveTypeName.INT32)
+            .as(LogicalTypeAnnotation.decimalType(2, 9))
+            .named("price");
+        PreloadedRowGroupMetadata metadata = buildSinglePageMetadata("price", ptype, intToBuffer(1000), intToBuffer(500000), PAGE_SIZE);
+        FilterPredicate pred = FilterApi.gt(FilterApi.doubleColumn("price"), 100.0);
+
+        RowRanges result = ColumnIndexRowRangesComputer.compute(pred, metadata, 0, PAGE_SIZE);
+
+        assertTrue("DECIMAL-encoded column must be kept conservatively for doubleColumn predicates", result.overlaps(0, PAGE_SIZE));
+    }
+
+    public void testFloat16EncodedDoubleColumnIsKeptConservatively() {
+        // Float16 column: FIXED_LEN_BYTE_ARRAY(2) + Float16 logical type.
+        // Stats represent 1.0 (min=0x3C00) and 2.0 (max=0x4000).
+        //
+        // Today's decodeValue Double branch sees a 2-byte buffer: `ordered.remaining() == Float.BYTES`
+        // (2 == 4) is false, so it falls through to ordered.getDouble(), which over-reads the
+        // 2-byte buffer and throws BufferUnderflowException. The test therefore fails today with
+        // an exception. Phase B detects the Float16 logical type and returns null from
+        // decodeValue, routing the page through the conservative null branch. Passes after Phase B.
+        PrimitiveType ptype = Types.required(PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY)
+            .length(2)
+            .as(LogicalTypeAnnotation.float16Type())
+            .named("ratio");
+        ByteBuffer min = ByteBuffer.wrap(new byte[] { 0x00, 0x3C }); // 1.0
+        ByteBuffer max = ByteBuffer.wrap(new byte[] { 0x00, 0x40 }); // 2.0
+        PreloadedRowGroupMetadata metadata = buildSinglePageMetadata("ratio", ptype, min, max, PAGE_SIZE);
+        FilterPredicate pred = FilterApi.lt(FilterApi.doubleColumn("ratio"), 0.5);
+
+        RowRanges result = ColumnIndexRowRangesComputer.compute(pred, metadata, 0, PAGE_SIZE);
+
+        assertTrue("Float16-encoded column must be kept conservatively for doubleColumn predicates", result.overlaps(0, PAGE_SIZE));
+    }
+
     public void testBooleanColumnEq() {
         PreloadedRowGroupMetadata metadata = buildBooleanMetadata("flag", PAGE_COUNT, PAGE_SIZE);
         FilterPredicate pred = FilterApi.eq(FilterApi.booleanColumn("flag"), true);
@@ -400,7 +485,7 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     /**
@@ -428,7 +513,7 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     /**
@@ -455,7 +540,7 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     private static PreloadedRowGroupMetadata buildLongMetadata(String columnPath, int pageCount, int pageSize) {
@@ -480,7 +565,7 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     private static PreloadedRowGroupMetadata buildDoubleMetadata(String columnPath, int pageCount, int pageSize) {
@@ -505,7 +590,7 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     /**
@@ -534,7 +619,36 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         var typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         var typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
+    }
+
+    /**
+     * Single-page metadata helper for the schema-driven decode tests. The caller supplies both
+     * the {@link PrimitiveType} (driving the file MessageType captured on
+     * {@link PreloadedRowGroupMetadata}) and the raw min/max stats bytes — necessary because
+     * DECIMAL and Float16 columns intentionally produce buffer lengths (4 and 2 bytes) that the
+     * legacy {@code remaining() == Float.BYTES} heuristic mishandles, and we want to drive the
+     * exact buffer the runtime would observe rather than re-encode via a Java primitive.
+     */
+    private static PreloadedRowGroupMetadata buildSinglePageMetadata(
+        String columnPath,
+        PrimitiveType primitiveType,
+        ByteBuffer min,
+        ByteBuffer max,
+        int pageSize
+    ) {
+        List<ByteBuffer> minValues = List.of(min);
+        List<ByteBuffer> maxValues = List.of(max);
+        List<Boolean> nullPages = List.of(Boolean.FALSE);
+        List<PageLocation> pageLocations = List.of(new PageLocation(0L, pageSize * 4, 0));
+
+        ColumnIndex ci = new ColumnIndex(nullPages, minValues, maxValues, BoundaryOrder.UNORDERED);
+        OffsetIndex oi = new OffsetIndex(pageLocations);
+
+        var typedCi = ParquetMetadataConverter.fromParquetColumnIndex(primitiveType, ci);
+        var typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
+
+        return buildMetadata(columnPath, primitiveType, typedCi, typedOi);
     }
 
     private static PreloadedRowGroupMetadata buildBinaryMetadata(String columnPath, int pageCount, int pageSize) {
@@ -559,7 +673,7 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     private static PreloadedRowGroupMetadata buildBooleanMetadata(String columnPath, int pageCount, int pageSize) {
@@ -584,11 +698,12 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         org.apache.parquet.internal.column.columnindex.ColumnIndex typedCi = ParquetMetadataConverter.fromParquetColumnIndex(ptype, ci);
         org.apache.parquet.internal.column.columnindex.OffsetIndex typedOi = ParquetMetadataConverter.fromParquetOffsetIndex(oi);
 
-        return buildMetadata(columnPath, typedCi, typedOi);
+        return buildMetadata(columnPath, ptype, typedCi, typedOi);
     }
 
     private static PreloadedRowGroupMetadata buildMetadata(
         String columnPath,
+        PrimitiveType primitiveType,
         org.apache.parquet.internal.column.columnindex.ColumnIndex ci,
         org.apache.parquet.internal.column.columnindex.OffsetIndex oi
     ) {
@@ -596,7 +711,8 @@ public class ColumnIndexRowRangesComputerTests extends ESTestCase {
         Map<String, org.apache.parquet.internal.column.columnindex.OffsetIndex> offsetIndexes = new HashMap<>();
         columnIndexes.put("0:" + columnPath, ci);
         offsetIndexes.put("0:" + columnPath, oi);
-        return new PreloadedRowGroupMetadata(columnIndexes, offsetIndexes);
+        MessageType schema = new MessageType("test", primitiveType);
+        return new PreloadedRowGroupMetadata(columnIndexes, offsetIndexes, schema);
     }
 
     private static ByteBuffer intToBuffer(int value) {
