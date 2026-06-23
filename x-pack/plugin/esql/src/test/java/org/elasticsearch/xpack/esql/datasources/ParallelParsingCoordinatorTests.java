@@ -15,6 +15,7 @@ import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.MockBigArrays;
 import org.elasticsearch.common.util.PageCacheRecycler;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BytesRefBlock;
@@ -50,10 +51,13 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -145,6 +149,80 @@ public class ParallelParsingCoordinatorTests extends ESTestCase {
             tracking.bytesConsumed.get(),
             Matchers.lessThan(fileLength / 2)
         );
+    }
+
+    /**
+     * Reproduces elastic/esql-planning#896 face B (silent wrong count). {@link ParallelParsingCoordinator#computeSegments}
+     * probes for record boundaries by opening a range stream at an arbitrary nominal split offset and calling
+     * {@link RecordSplitter#findNextRecordBoundary}, which always begins its scan assuming it is <em>outside</em> a quoted
+     * field (see {@code CsvRecordSplitter}). When that nominal offset lands inside a quoted field that contains an embedded
+     * newline, the scanner mistakes the embedded newline for a record terminator and returns a boundary <em>inside</em> the
+     * quoted field. A worker then reads the next segment as if that mid-quote offset were a record start, splitting the
+     * record across the seam and drifting the row count.
+     * <p>
+     * Ground truth is the same primitive used in-contract: scanning sequentially from offset 0, every call starts at a real
+     * record boundary, so the set of offsets it yields is exactly the set of true record starts. The invariant a correct
+     * segmentation must hold is that every computed boundary is one of those true starts. This is red on {@code main} (one
+     * boundary lands inside the quoted field) and goes green once segmentation carries quote state across the seam.
+     */
+    public void testComputeSegmentsNeverBoundaryInsideQuotedField() throws Exception {
+        // A quoted v field with an embedded newline, with a long run of bytes before that newline so the danger zone is
+        // wide and the nominal split point (fileLength/2) reliably lands inside the quoted region.
+        StringBuilder sb = new StringBuilder("k,v\n");
+        for (int i = 0; i < 10; i++) {
+            sb.append("r").append(i).append(",val\n");
+        }
+        sb.append("D,\"");
+        sb.append("x".repeat(400));
+        sb.append("\n"); // embedded newline INSIDE the quoted field
+        sb.append("y".repeat(20));
+        sb.append("\"\n");
+        for (int i = 0; i < 10; i++) {
+            sb.append("s").append(i).append(",val\n");
+        }
+        byte[] data = sb.toString().getBytes(StandardCharsets.UTF_8);
+
+        CsvFormatReader reader = new CsvFormatReader(blockFactory());
+        RecordSplitter splitter = reader.recordSplitter(SegmentableFormatReader.DEFAULT_MAX_RECORD_BYTES);
+        StorageObject obj = new InMemoryStorageObject(data);
+
+        // Small minSegment so this tiny file still splits; parallelism=2 puts the nominal split near fileLength/2.
+        List<long[]> segments = ParallelParsingCoordinator.computeSegments(reader, obj, data.length, 2, 8);
+        assertThat("test needs a real split to exercise the quoted seam", segments.size(), Matchers.greaterThan(1));
+
+        Set<Long> trueStarts = trueRecordStarts(splitter, data);
+        for (int i = 1; i < segments.size(); i++) {
+            long boundary = segments.get(i)[0];
+            assertTrue(
+                "segment boundary at byte ["
+                    + boundary
+                    + "] must be a real record start, not a position inside a quoted field; true starts="
+                    + trueStarts,
+                trueStarts.contains(boundary)
+            );
+        }
+    }
+
+    /**
+     * The set of true record-start byte offsets, computed by walking {@link RecordSplitter#findNextRecordBoundary}
+     * sequentially from offset 0. Each call therefore starts at a real boundary (the primitive's documented
+     * precondition), so the offsets it yields are correct even across quoted fields with embedded newlines.
+     */
+    private static Set<Long> trueRecordStarts(RecordSplitter splitter, byte[] data) throws IOException {
+        Set<Long> starts = new HashSet<>();
+        starts.add(0L);
+        long pos = 0;
+        while (pos < data.length) {
+            long skipped = splitter.findNextRecordBoundary(new ByteArrayInputStream(data, (int) pos, data.length - (int) pos));
+            if (skipped < 0) {
+                break;
+            }
+            pos += skipped;
+            if (pos < data.length) {
+                starts.add(pos);
+            }
+        }
+        return starts;
     }
 
     /**
@@ -449,6 +527,84 @@ public class ParallelParsingCoordinatorTests extends ESTestCase {
             }
         });
         assertNotNull("Should propagate rejection error", ex);
+    }
+
+    /**
+     * Reproduces elastic/esql-planning#896 face A&prime;: a segmented uncompressed read can open more
+     * concurrent segment streams ({@code max_concurrent_open_segments}) than the per-query concurrency
+     * budget allows. The over-budget worker cannot acquire a permit within the acquire timeout and fails
+     * with {@link EsRejectedExecutionException} &mdash; backpressure, which on its own maps to 429 &mdash; but the
+     * operator read boundary's {@link ExternalFailures#classify} has no branch for that type and downgrades
+     * it to a 500 {@code ExternalServerException}. This test pins the desired 429; it is red on {@code main}
+     * (the last assertion sees 500) and goes green with the classification fix in the follow-up commit.
+     * <p>
+     * The whole chain runs on real classes: a real {@link QueryConcurrencyBudget} (one permit, a short
+     * acquire timeout so the test does not wait the production 60s default), a real
+     * {@link QueryBudgetedStorageObject} wrapping the in-memory delegate, and the real
+     * {@link ParallelParsingCoordinator}. {@link PermitHoldingLineReader} keeps the single permit held while
+     * the second worker times out, making the over-subscription deterministic rather than timing-dependent.
+     */
+    public void testBudgetOverSubscriptionSurfacesAsTooManyRequests() throws Exception {
+        byte[] content = repeatedLines(600);
+        // One permit, 100ms acquire timeout: with a 2-wide open-segment window the second worker is over
+        // budget and times out fast instead of after the production 60s default.
+        QueryConcurrencyBudget budget = new QueryConcurrencyBudget(1, 100L, null);
+        StorageObject budgeted = new QueryBudgetedStorageObject(new InMemoryStorageObject(content), budget);
+
+        CountDownLatch hold = new CountDownLatch(1);
+        PermitHoldingLineReader reader = new PermitHoldingLineReader(blockFactory(), hold);
+
+        // Need >1 segment so the 2-wide window genuinely over-subscribes the 1-permit budget.
+        assertThat(
+            "test needs a multi-segment file to over-subscribe the budget",
+            ParallelParsingCoordinator.computeSegments(reader, budgeted, content.length, 2, 1).size(),
+            Matchers.greaterThan(1)
+        );
+
+        ExecutorService exec = Executors.newFixedThreadPool(2);
+        CloseableIterator<Page> iter = ParallelParsingCoordinator.parallelRead(
+            reader,
+            budgeted,
+            List.of("line"),
+            50,
+            2,
+            exec,
+            null,
+            false,
+            true,
+            null,
+            2,
+            null
+        );
+        try {
+            RuntimeException caught = expectThrows(RuntimeException.class, () -> {
+                while (iter.hasNext()) {
+                    iter.next().releaseBlocks();
+                }
+            });
+            assertThat(
+                "the over-budget waiter must surface as a budget rejection",
+                caught,
+                Matchers.instanceOf(EsRejectedExecutionException.class)
+            );
+            assertEquals(
+                "a bare budget rejection is naturally backpressure (429)",
+                RestStatus.TOO_MANY_REQUESTS,
+                ExceptionsHelper.status(caught)
+            );
+            // The bug: the read boundary classify() downgrades the 429 backpressure to a 500 server fault.
+            assertEquals(
+                "budget rejection must classify as backpressure (429), not a server fault (500)",
+                RestStatus.TOO_MANY_REQUESTS,
+                ExceptionsHelper.status(ExternalFailures.classify(caught))
+            );
+        } finally {
+            // Release the permit holder so the still-running worker finishes and close() returns promptly.
+            hold.countDown();
+            iter.close();
+            exec.shutdown();
+            assertTrue("executor did not terminate", exec.awaitTermination(60, TimeUnit.SECONDS));
+        }
     }
 
     private static final int REPRO_PARALLELISM = 12;
@@ -1214,6 +1370,36 @@ public class ParallelParsingCoordinatorTests extends ESTestCase {
                     delegate.close();
                 }
             };
+        }
+    }
+
+    /**
+     * {@link LineFormatReader} variant that, once it has opened the segment stream (and so acquired the
+     * budget permit inside {@code super.read()}), blocks on a latch before returning the page iterator. This
+     * keeps the single permit held while a second, over-budget worker tries to acquire one, forcing the
+     * deterministic acquire timeout that reproduces elastic/esql-planning#896 face A&prime;. The losing worker
+     * throws from {@code super.read()}'s {@code newStream()} before reaching the latch, so only the permit
+     * holder parks. Used by {@link #testBudgetOverSubscriptionSurfacesAsTooManyRequests}.
+     */
+    private static class PermitHoldingLineReader extends LineFormatReader {
+        private final CountDownLatch hold;
+
+        PermitHoldingLineReader(BlockFactory blockFactory, CountDownLatch hold) {
+            super(blockFactory);
+            this.hold = hold;
+        }
+
+        @Override
+        public CloseableIterator<Page> read(StorageObject object, FormatReadContext context) throws IOException {
+            // super.read() opens the underlying stream, which acquires the budget permit. The over-budget
+            // worker fails here (timeout -> EsRejectedExecutionException) and never reaches the await below.
+            CloseableIterator<Page> delegate = super.read(object, context);
+            try {
+                hold.await(60, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return delegate;
         }
     }
 
