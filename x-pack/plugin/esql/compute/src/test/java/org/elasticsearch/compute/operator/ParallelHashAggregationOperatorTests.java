@@ -38,6 +38,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 import static org.hamcrest.Matchers.equalTo;
@@ -166,6 +167,33 @@ public class ParallelHashAggregationOperatorTests extends ComputeTestCase {
         HashAggregationOperator.Status hashStatus = (HashAggregationOperator.Status) operatorStatus.status();
         var partitioningStatus = (ParallelHashAggregationOperator.PartitioningStatus) hashStatus.extraFields.get(0);
         assertThat(partitioningStatus.partitionedBlocksReceived(), greaterThan(0));
+    }
+
+    public void testWorkerCpuIsInDriverCpu() {
+        HashAggregationOperator.ParallelConfig config = new HashAggregationOperator.ParallelConfig(
+            threadPool.generic(),
+            randomIntBetween(2, 32),
+            1,
+            randomIntBetween(256, 4 * 1024)
+        );
+        // Only the workers' threads advance this clock, by a fixed step per reading, so any CPU time in the driver's status
+        // is CPU time the workers measured, however coarse the real thread CPU clock is.
+        AtomicLong workerClock = new AtomicLong();
+        CpuTracker cpuTracker = new CpuTracker(
+            () -> Thread.currentThread().getName().contains("[generic]") ? workerClock.addAndGet(1000) : 0
+        );
+        BlockFactory blockFactory = blockFactory();
+        DriverContext driverContext = new DriverContext(
+            blockFactory.bigArrays(),
+            blockFactory,
+            null,
+            null,
+            DriverContext.WarningsMode.COLLECT,
+            cpuTracker
+        );
+        driverContexts.add(driverContext);
+        var status = runTest(between(10 * 1024, 50 * 1000), true, randomBoolean(), blockFactory, driverContext, config);
+        assertThat(status.cpuNanos(), greaterThan(0L));
     }
 
     record Key(Long longValue, Integer intValue) {}

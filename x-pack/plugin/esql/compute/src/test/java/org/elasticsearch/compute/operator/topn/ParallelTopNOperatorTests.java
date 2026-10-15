@@ -10,6 +10,7 @@ package org.elasticsearch.compute.operator.topn;
 import org.apache.lucene.tests.util.RamUsageTester;
 import org.apache.lucene.util.Accountable;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.Constants;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
@@ -24,6 +25,7 @@ import org.elasticsearch.compute.data.OrdinalBytesRefBlock;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.DriverContext;
 import org.elasticsearch.compute.operator.Operator;
+import org.elasticsearch.compute.operator.ThreadCpuTimer;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.test.MapMatcher;
 import org.elasticsearch.threadpool.FixedExecutorBuilder;
@@ -471,6 +473,25 @@ public class ParallelTopNOperatorTests extends TopNOperatorTests {
 
         try (ParallelTopNOperator op = new ParallelTopNOperator(config, driverContext, initialWorker)) {
             assertThat(op.toString(), equalTo("ParallelTopNOperator[workers=" + (workerCount + 1) + "]"));
+        }
+    }
+
+    public void testWorkerCpuIsMetered() throws Exception {
+        assumeFalse("Windows has bad CPU counters, skip", Constants.WINDOWS);
+        assumeTrue("needs thread CPU time", ThreadCpuTimer.currentNanos() >= 0);
+        DriverContext driverContext = driverContext();
+        TopNOperator initialWorker = workerOnlyFactory().get(driverContext);
+        TopNOperator.ParallelWorkerConfig config = new TopNOperator.ParallelWorkerConfig(workerExecutor(), between(1, 4), 10, 0);
+        ParallelTopNOperator op = new ParallelTopNOperator(config, driverContext, initialWorker);
+        try {
+            for (int i = 0; i < 100; i++) {
+                op.addInput(buildLongPage(driverContext.blockFactory(), random().longs(1000)));
+            }
+            op.finish();
+            assertBusy(() -> assertThat(op.isBlocked(), sameInstance(Operator.NOT_BLOCKED)));
+            assertThat(driverContext.cpuNanos(), greaterThan(0L));
+        } finally {
+            drainAndClose(op);
         }
     }
 

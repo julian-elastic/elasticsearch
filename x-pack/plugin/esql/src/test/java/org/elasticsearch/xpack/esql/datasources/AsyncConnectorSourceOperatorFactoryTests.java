@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.esql.datasources;
 
+import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.util.BigArrays;
@@ -17,6 +18,7 @@ import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.DriverContext;
 import org.elasticsearch.compute.operator.Limiter;
 import org.elasticsearch.compute.operator.SourceOperator;
+import org.elasticsearch.compute.operator.ThreadCpuTimer;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.datasources.spi.Connector;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalSplit;
@@ -37,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -126,6 +129,40 @@ public class AsyncConnectorSourceOperatorFactoryTests extends ESTestCase {
             assertThat("page popped after remaining hit 0 must be released", rows, equalTo(1));
         } finally {
             proceedSecond.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    public void testProducerCpuIsMeteredIntoDriver() throws Exception {
+        assumeTrue("needs thread CPU time", ThreadCpuTimer.currentNanos() >= 0);
+        int splitCount = between(1, 4);
+        List<ExternalSplit> splits = new ArrayList<>();
+        for (int i = 0; i < splitCount; i++) {
+            splits.add(new StubSplit("s" + i));
+        }
+        long burnNanos = TimeUnit.MILLISECONDS.toNanos(between(1, 3));
+        QueryRequest request = new QueryRequest("target", List.of("col"), List.of(), Map.of(), 100, TEST_BLOCK_FACTORY);
+        ExecutorService pool = Executors.newCachedThreadPool(EsExecutors.daemonThreadFactory("test", "acsof-cpu"));
+        try {
+            AsyncConnectorSourceOperatorFactory factory = new AsyncConnectorSourceOperatorFactory(
+                new CpuBurningConnector(burnNanos),
+                request,
+                10,
+                pool,
+                new ExternalSliceQueue(splits)
+            );
+            DriverContext ctx = new DriverContext(BigArrays.NON_RECYCLING_INSTANCE, TEST_BLOCK_FACTORY, null);
+            SourceOperator operator = factory.get(ctx);
+            assertThat(drainRows(operator), equalTo(splitCount));
+            operator.close();
+            ctx.finish();
+            PlainActionFuture<Void> producerDone = new PlainActionFuture<>();
+            ctx.waitForAsyncActions(producerDone);
+            producerDone.actionGet(30, TimeUnit.SECONDS);
+
+            assertThat(ctx.cpuNanos(), greaterThanOrEqualTo(splitCount * burnNanos));
+        } finally {
             pool.shutdownNow();
             assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
         }
@@ -260,6 +297,55 @@ public class AsyncConnectorSourceOperatorFactoryTests extends ESTestCase {
 
         @Override
         public void close() {}
+    }
+
+    /** Emits one single-row page per split, spending {@code burnNanos} of CPU time to produce it. */
+    private static class CpuBurningConnector implements Connector {
+        private final long burnNanos;
+
+        CpuBurningConnector(long burnNanos) {
+            this.burnNanos = burnNanos;
+        }
+
+        @Override
+        public ResultCursor execute(QueryRequest request, Split split) {
+            return cursor();
+        }
+
+        @Override
+        public ResultCursor execute(QueryRequest request, ExternalSplit split) {
+            return cursor();
+        }
+
+        @Override
+        public void close() {}
+
+        private ResultCursor cursor() {
+            return new ResultCursor() {
+                private boolean emitted;
+
+                @Override
+                public boolean hasNext() {
+                    return emitted == false;
+                }
+
+                @Override
+                public Page next() {
+                    if (hasNext() == false) {
+                        throw new NoSuchElementException();
+                    }
+                    emitted = true;
+                    long start = ThreadCpuTimer.currentNanos();
+                    while (ThreadCpuTimer.currentNanos() - start < burnNanos) {
+                        Thread.onSpinWait();
+                    }
+                    return new Page(TEST_BLOCK_FACTORY.newConstantIntBlockWith(1, 1));
+                }
+
+                @Override
+                public void close() {}
+            };
+        }
     }
 
     private static class StubSplit implements ExternalSplit {
