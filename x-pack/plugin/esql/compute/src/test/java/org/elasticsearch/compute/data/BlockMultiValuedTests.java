@@ -39,6 +39,7 @@ import static org.elasticsearch.compute.test.BlockTestUtils.valuesAtPositions;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -151,6 +152,33 @@ public class BlockMultiValuedTests extends ESTestCase {
             int denseBlocks = countLookupBlocks(b.block(), positionCount, 1);
             int sparseBlocks = countLookupBlocks(b.block(), positionCount, 100);
             assertThat(sparseBlocks, lessThanOrEqualTo(denseBlocks));
+            // Blocks average well over the minimum size, so the target, not the minimum, ends them.
+            assertThat(denseBlocks, lessThan(positionCount / (2 * (Operator.MIN_TARGET_PAGE_SIZE + 1))));
+        } finally {
+            b.block().close();
+        }
+    }
+
+    public void testLookupSplitBlocksHaveNoSpareCapacity() {
+        if (elementType == ElementType.BYTES_REF || nullAllowed) {
+            return;
+        }
+        var b = RandomBlock.randomBlock(blockFactory(), elementType, between(2, 1000), false, 1, 1, 0, 0);
+        int positionCount = 16 * 1024;
+        try (IntBlock.Builder builder = blockFactory().newIntBlockBuilder(positionCount)) {
+            for (int p = 0; p < positionCount; p++) {
+                builder.appendInt(between(0, b.block().getPositionCount() - 1));
+            }
+            try (
+                IntBlock positions = builder.build();
+                ReleasableIterator<? extends Block> lookup = b.block().lookup(positions, ByteSizeValue.ofKb(10))
+            ) {
+                while (lookup.hasNext()) {
+                    try (Block block = lookup.next(); Block exact = block.deepCopy(blockFactory())) {
+                        assertThat(block.ramBytesUsed(), equalTo(exact.ramBytesUsed()));
+                    }
+                }
+            }
         } finally {
             b.block().close();
         }

@@ -36,7 +36,7 @@ public final class DoubleLookup implements ReleasableIterator<DoubleBlock> {
         this.values = values;
         this.positions = positions;
         this.targetByteSize = targetBlockSize.getBytes();
-        // The builder counts its preallocated array in estimatedBytes, so preallocate only as many positions as fit under the target.
+        // Preallocated capacity counts toward the builder's estimatedBytes, so preallocate only as many positions as fit under the target.
         long fittingPositions = (targetByteSize - RamUsageEstimator.NUM_BYTES_ARRAY_HEADER - 1) / PREALLOCATED_BYTES_PER_VALUE;
         this.initialPositions = (int) Math.min(Integer.MAX_VALUE, Math.max(1, fittingPositions));
     }
@@ -65,7 +65,8 @@ public final class DoubleLookup implements ReleasableIterator<DoubleBlock> {
                 }
                 position++;
                 // TOOD what if the estimate is super huge? should we break even with less than MIN_TARGET?
-                if (++count > Operator.MIN_TARGET_PAGE_SIZE && builder.estimatedBytes() >= targetByteSize) {
+                // A full builder would have to grow past the target to take another position.
+                if (++count > Operator.MIN_TARGET_PAGE_SIZE && (count >= initialSize || builder.estimatedBytes() >= targetByteSize)) {
                     break;
                 }
             }

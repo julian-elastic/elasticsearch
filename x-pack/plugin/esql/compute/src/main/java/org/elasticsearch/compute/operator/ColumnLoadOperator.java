@@ -54,9 +54,9 @@ public class ColumnLoadOperator extends AbstractPageMappingToIteratorOperator {
     static final long MIN_TARGET_BLOCK_BYTES = ByteSizeValue.ofKb(10).getBytes();
 
     /**
-     * The target size of each loaded block. Each loaded block gets an equal share of the page
-     * budget, so pages the source already sized to fit {@link Operator#TARGET_PAGE_SIZE} pass
-     * through whole. The floor keeps pages with many columns from being cut into minimum-size pages.
+     * The target size of each loaded block: an equal share of {@link Operator#TARGET_PAGE_SIZE}
+     * per block on the page. A page passes through whole only when the loaded column is no wider
+     * than that share. The floor keeps pages with many columns from being cut into minimum-size pages.
      */
     static ByteSizeValue targetBlockSize(int inputBlockCount) {
         return ByteSizeValue.ofBytes(Math.max(MIN_TARGET_BLOCK_BYTES, Operator.TARGET_PAGE_SIZE / (inputBlockCount + 1)));

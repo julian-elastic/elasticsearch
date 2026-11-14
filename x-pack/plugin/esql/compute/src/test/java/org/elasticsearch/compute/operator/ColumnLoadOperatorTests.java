@@ -7,9 +7,11 @@
 
 package org.elasticsearch.compute.operator;
 
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.BlockFactory;
+import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.IntBlock;
 import org.elasticsearch.compute.data.IntVector;
 import org.elasticsearch.compute.data.LongBlock;
@@ -104,7 +106,7 @@ public class ColumnLoadOperatorTests extends OperatorTestCase {
         DriverContext driverContext = driverContext();
         BlockFactory blockFactory = driverContext.blockFactory();
         int longColumns = 3;
-        // A builder that grows to fit the loaded column crosses the target before it is full.
+        // Just under the target, so the page splits if the builder has to grow to hold the loaded column.
         int positionCount = (int) (ColumnLoadOperator.targetBlockSize(longColumns + 1).getBytes() * 95 / 100 / Long.BYTES);
         Block[] blocks = new Block[longColumns + 1];
         try (IntVector.FixedBuilder builder = blockFactory.newIntVectorFixedBuilder(positionCount)) {
@@ -128,6 +130,50 @@ public class ColumnLoadOperatorTests extends OperatorTestCase {
         } finally {
             for (Page p : results) {
                 p.releaseBlocks();
+            }
+        }
+    }
+
+    public void testWidePageLoadsBytesRefWhole() {
+        for (int nonNullEvery : new int[] { 1, 10 }) {
+            DriverContext driverContext = driverContext();
+            BlockFactory blockFactory = driverContext.blockFactory();
+            int positionCount = 5000;
+            // Seven blocks put the target at 32KB: the builder's first 16KB pages for values and offsets alone reach it.
+            Block[] blocks = new Block[7];
+            try (IntBlock.Builder builder = blockFactory.newIntBlockBuilder(positionCount)) {
+                for (int p = 0; p < positionCount; p++) {
+                    if (p % nonNullEvery == 0) {
+                        builder.appendInt(between(0, 1));
+                    } else {
+                        builder.appendNull();
+                    }
+                }
+                blocks[0] = builder.build();
+            }
+            for (int c = 1; c < blocks.length; c++) {
+                try (IntVector.FixedBuilder builder = blockFactory.newIntVectorFixedBuilder(positionCount)) {
+                    for (int p = 0; p < positionCount; p++) {
+                        builder.appendInt(p);
+                    }
+                    blocks[c] = builder.build().asBlock();
+                }
+            }
+            BytesRefBlock values;
+            try (BytesRefBlock.Builder builder = TestBlockFactory.getNonBreakingInstance().newBytesRefBlockBuilder(2)) {
+                values = builder.appendBytesRef(new BytesRef("a")).appendBytesRef(new BytesRef("bb")).build();
+            }
+            List<Page> results = new TestDriverRunner().builder(driverContext)
+                .input(new Page(blocks))
+                .run(new ColumnLoadOperator.Factory(new ColumnLoadOperator.Values("values", values), 0));
+            try {
+                assertThat(results, hasSize(1));
+                assertThat(results.get(0).getPositionCount(), equalTo(positionCount));
+            } finally {
+                for (Page p : results) {
+                    p.releaseBlocks();
+                }
+                values.close();
             }
         }
     }

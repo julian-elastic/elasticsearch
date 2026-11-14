@@ -28,6 +28,9 @@ $if(BytesRef)$
     private static final int PREALLOCATED_BYTES_PER_VALUE = 3 + Integer.BYTES;
     private final BytesRef firstScratch = new BytesRef();
     private final BytesRef valueScratch = new BytesRef();
+    // BytesRefArray allocates in whole pages, so its estimatedBytes can pass the target long before the values do.
+    // Blocks are sized by the bytes copied instead: each entry's value bytes plus its int offset.
+    private long copiedBytes;
 $else$
     private static final int PREALLOCATED_BYTES_PER_VALUE = $BYTES$;
 $endif$
@@ -46,7 +49,7 @@ $endif$
         this.values = values;
         this.positions = positions;
         this.targetByteSize = targetBlockSize.getBytes();
-        // The builder counts its preallocated array in estimatedBytes, so preallocate only as many positions as fit under the target.
+        // Preallocated capacity counts toward the builder's estimatedBytes, so preallocate only as many positions as fit under the target.
         long fittingPositions = (targetByteSize - RamUsageEstimator.NUM_BYTES_ARRAY_HEADER - 1) / PREALLOCATED_BYTES_PER_VALUE;
         this.initialPositions = (int) Math.min(Integer.MAX_VALUE, Math.max(1, fittingPositions));
     }
@@ -59,6 +62,9 @@ $endif$
     @Override
     public $Type$Block next() {
         int initialSize = Math.min(positions.getPositionCount() - position, initialPositions);
+$if(BytesRef)$
+        copiedBytes = 0;
+$endif$
         try ($Type$Block.Builder builder = positions.blockFactory().new$Type$BlockBuilder(initialSize)) {
             int count = 0;
             while (position < positions.getPositionCount()) {
@@ -74,8 +80,17 @@ $endif$
                     default -> builder.endPositionEntry();
                 }
                 position++;
+$if(BytesRef)$
+                // Every entry takes an int offset, including the empty value a null writes.
+                copiedBytes += (long) Integer.BYTES * Math.max(1, valuesInPosition);
+$endif$
                 // TOOD what if the estimate is super huge? should we break even with less than MIN_TARGET?
-                if (++count > Operator.MIN_TARGET_PAGE_SIZE && builder.estimatedBytes() >= targetByteSize) {
+$if(BytesRef)$
+                if (++count > Operator.MIN_TARGET_PAGE_SIZE && copiedBytes >= targetByteSize) {
+$else$
+                // A full builder would have to grow past the target to take another position.
+                if (++count > Operator.MIN_TARGET_PAGE_SIZE && (count >= initialSize || builder.estimatedBytes() >= targetByteSize)) {
+$endif$
                     break;
                 }
             }
@@ -93,6 +108,7 @@ $endif$
             if (valuesInPosition == 0) {
 $if(BytesRef)$
                 first = values.get$Type$(i, firstScratch);
+                copiedBytes += first.length;
 $else$
                 first = values.get$Type$(i);
 $endif$
@@ -108,7 +124,9 @@ $endif$
                 throw new IllegalArgumentException("Found a single entry with " + valuesInPosition + " entries");
             }
 $if(BytesRef)$
-            builder.append$Type$(values.get$Type$(i, valueScratch));
+            BytesRef value = values.get$Type$(i, valueScratch);
+            copiedBytes += value.length;
+            builder.append$Type$(value);
 $else$
             builder.append$Type$(values.get$Type$(i));
 $endif$

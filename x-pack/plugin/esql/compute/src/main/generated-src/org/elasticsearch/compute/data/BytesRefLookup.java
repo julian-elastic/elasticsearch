@@ -25,6 +25,9 @@ public final class BytesRefLookup implements ReleasableIterator<BytesRefBlock> {
     private static final int PREALLOCATED_BYTES_PER_VALUE = 3 + Integer.BYTES;
     private final BytesRef firstScratch = new BytesRef();
     private final BytesRef valueScratch = new BytesRef();
+    // BytesRefArray allocates in whole pages, so its estimatedBytes can pass the target long before the values do.
+    // Blocks are sized by the bytes copied instead: each entry's value bytes plus its int offset.
+    private long copiedBytes;
     private final BytesRefBlock values;
     private final IntBlock positions;
     private final long targetByteSize;
@@ -40,7 +43,7 @@ public final class BytesRefLookup implements ReleasableIterator<BytesRefBlock> {
         this.values = values;
         this.positions = positions;
         this.targetByteSize = targetBlockSize.getBytes();
-        // The builder counts its preallocated array in estimatedBytes, so preallocate only as many positions as fit under the target.
+        // Preallocated capacity counts toward the builder's estimatedBytes, so preallocate only as many positions as fit under the target.
         long fittingPositions = (targetByteSize - RamUsageEstimator.NUM_BYTES_ARRAY_HEADER - 1) / PREALLOCATED_BYTES_PER_VALUE;
         this.initialPositions = (int) Math.min(Integer.MAX_VALUE, Math.max(1, fittingPositions));
     }
@@ -53,6 +56,7 @@ public final class BytesRefLookup implements ReleasableIterator<BytesRefBlock> {
     @Override
     public BytesRefBlock next() {
         int initialSize = Math.min(positions.getPositionCount() - position, initialPositions);
+        copiedBytes = 0;
         try (BytesRefBlock.Builder builder = positions.blockFactory().newBytesRefBlockBuilder(initialSize)) {
             int count = 0;
             while (position < positions.getPositionCount()) {
@@ -68,8 +72,10 @@ public final class BytesRefLookup implements ReleasableIterator<BytesRefBlock> {
                     default -> builder.endPositionEntry();
                 }
                 position++;
+                // Every entry takes an int offset, including the empty value a null writes.
+                copiedBytes += (long) Integer.BYTES * Math.max(1, valuesInPosition);
                 // TOOD what if the estimate is super huge? should we break even with less than MIN_TARGET?
-                if (++count > Operator.MIN_TARGET_PAGE_SIZE && builder.estimatedBytes() >= targetByteSize) {
+                if (++count > Operator.MIN_TARGET_PAGE_SIZE && copiedBytes >= targetByteSize) {
                     break;
                 }
             }
@@ -86,6 +92,7 @@ public final class BytesRefLookup implements ReleasableIterator<BytesRefBlock> {
         for (int i = start; i < end; i++) {
             if (valuesInPosition == 0) {
                 first = values.getBytesRef(i, firstScratch);
+                copiedBytes += first.length;
                 valuesInPosition++;
                 continue;
             }
@@ -97,7 +104,9 @@ public final class BytesRefLookup implements ReleasableIterator<BytesRefBlock> {
                 // TODO replace this with a warning and break
                 throw new IllegalArgumentException("Found a single entry with " + valuesInPosition + " entries");
             }
-            builder.appendBytesRef(values.getBytesRef(i, valueScratch));
+            BytesRef value = values.getBytesRef(i, valueScratch);
+            copiedBytes += value.length;
+            builder.appendBytesRef(value);
             valuesInPosition++;
         }
     }
