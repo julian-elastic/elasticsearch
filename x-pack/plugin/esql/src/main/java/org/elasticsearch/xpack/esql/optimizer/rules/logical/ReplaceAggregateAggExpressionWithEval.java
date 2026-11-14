@@ -64,11 +64,17 @@ public class ReplaceAggregateAggExpressionWithEval extends OptimizerRules.Optimi
         Map<GroupingFunction.NonEvaluatableGroupingFunction, Attribute> nonEvalGroupingAttributes = new HashMap<>(
             aggregate.groupings().size()
         );
-        aggregate.forEachExpressionUp(Alias.class, a -> {
-            if (a.child() instanceof GroupingFunction.NonEvaluatableGroupingFunction groupingFunction) {
-                nonEvalGroupingAttributes.put(groupingFunction, a.toAttribute());
-            } else {
-                aliasesBuilder.put(a.toAttribute(), a.child());
+        aggregate.forEachUp(plan -> {
+            // The aliases of another aggregate are computed over that aggregate's own input rows, so two of them with the same
+            // definition, e.g., COUNT(*) before and after a filter, can hold different values and must not be resolved.
+            if (plan == aggregate || plan instanceof Aggregate == false) {
+                plan.forEachExpression(Alias.class, a -> {
+                    if (a.child() instanceof GroupingFunction.NonEvaluatableGroupingFunction groupingFunction) {
+                        nonEvalGroupingAttributes.put(groupingFunction, a.toAttribute());
+                    } else {
+                        aliasesBuilder.put(a.toAttribute(), a.child());
+                    }
+                });
             }
         });
         var aliases = aliasesBuilder.build();

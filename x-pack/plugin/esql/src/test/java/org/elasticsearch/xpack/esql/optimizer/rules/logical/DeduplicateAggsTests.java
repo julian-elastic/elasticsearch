@@ -618,4 +618,51 @@ public class DeduplicateAggsTests extends AbstractLogicalPlanOptimizerTests {
         var countDistinct = as(as(aggregates.get(0), Alias.class).child(), CountDistinct.class);
         assertEquals("scalerank", as(countDistinct.field(), FieldAttribute.class).name());
     }
+
+    /**
+     * {@code before} and {@code after} are both {@code COUNT(*)}, but over different rows, so {@code MIN(before)} and
+     * {@code MIN(after)} are different aggregations.
+     */
+    public void testStackedInlineStatsSameAggOverIdenticallyDefinedColumns() {
+        var plan = plan("""
+            ROW v = [1, 2]
+            | MV_EXPAND v
+            | INLINE STATS before = COUNT(*)
+            | WHERE v == 1
+            | INLINE STATS after = COUNT(*)
+            | STATS before = MIN(before), after_min = MIN(after), after_max = MAX(after)
+            | LIMIT 1
+            """);
+
+        var limit = as(plan, Limit.class);
+        var agg = as(limit.child(), Aggregate.class);
+        var aggs = agg.aggregates();
+        assertThat(Expressions.names(aggs), contains("before", "after_min", "after_max"));
+        aggFieldName(aggs.get(0), Min.class, "before");
+        aggFieldName(aggs.get(1), Min.class, "after");
+        aggFieldName(aggs.get(2), Max.class, "after");
+        as(agg.child(), InlineJoin.class);
+    }
+
+    /**
+     * {@code c} and {@code d} are both {@code COUNT(*)}, but over different rows, so {@code min(c)} and {@code min(d)} are
+     * different aggregations.
+     */
+    public void testChainedStatsSameAggOverIdenticallyDefinedColumns() {
+        var plan = plan("""
+            from test
+            | stats c = count(*) by languages
+            | stats d = count(*) by c
+            | stats mc = min(c), md = min(d)
+            """);
+
+        var limit = as(plan, Limit.class);
+        var agg = as(limit.child(), Aggregate.class);
+        var aggs = agg.aggregates();
+        assertThat(Expressions.names(aggs), contains("mc", "md"));
+        aggFieldName(aggs.get(0), Min.class, "c");
+        aggFieldName(aggs.get(1), Min.class, "d");
+        var inner = as(agg.child(), Aggregate.class);
+        assertThat(Expressions.names(inner.aggregates()), contains("d", "c"));
+    }
 }

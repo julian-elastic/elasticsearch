@@ -6209,3 +6209,19 @@ FROM employees
 s1:long  | s2:long
 4824955  | 4825055
 ;
+
+stackedInlineStatsSameAggOverIdenticallyDefinedColumns
+required_capability: inline_stats
+required_capability: fix_deduplicate_aggs_over_aggregate_outputs
+
+ROW v = [1, 2]
+| MV_EXPAND v
+| INLINE STATS before = COUNT(*)
+| WHERE v == 1
+| INLINE STATS after = COUNT(*)
+| STATS before = MIN(before), after_min = MIN(after), after_max = MAX(after)
+;
+
+before:long | after_min:long | after_max:long
+2           | 1              | 1
+;

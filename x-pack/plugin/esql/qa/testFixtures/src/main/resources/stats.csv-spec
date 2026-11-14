@@ -5026,3 +5026,16 @@ n:long | cs:long  | languages.long:long
 2      | [6, 9]   | 1
 2      | [8, 11]  | 2
 ;
+
+chainedStatsSameAggOverIdenticallyDefinedColumns
+required_capability: fix_deduplicate_aggs_over_aggregate_outputs
+
+FROM employees
+| STATS c = COUNT(*) BY languages
+| STATS d = COUNT(*) BY c
+| STATS mc = MIN(c), md = MIN(d)
+;
+
+mc:long | md:long
+10      | 1
+;
